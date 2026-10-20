@@ -3539,3 +3539,196 @@
 
   Then redeploy. The cut-off for pushes and redeploys is 14:00 UTC, in 19
   minutes.
+
+❯ <ide_opened_file>The user opened the file
+  /Users/vladislav/Projects/test/payback-app/src/components/ChipSelect.tsx in
+  the IDE. This may or may not be related to the current
+  task.</ide_opened_file>
+
+❯ run rn reviewer agent
+
+⏺ I'm starting the rn-reviewer agent on the uncommitted Activity changes,
+  focused on correctness. I'll pass its findings on when it's done.
+
+⏺ rn-reviewer(Review activity changes)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ The reviewer is running on the Activity changes and focusing on correctness:
+  pagination and refresh races, signed amounts, web-specific issues such as
+  onEndReached firing repeatedly, and loading states that never end. I'll pass
+  its findings on when it's done.
+
+  It's 13:42. If the review takes too long, you can commit and redeploy the
+  current state now: it passes tests, tsc and eslint. A fix from the review can
+  follow in a separate commit, as long as it lands before 14:00.
+
+› Message from rn-reviewer
+  Note: the working tree is clean. `git status` shows nothing uncommitted, and
+  the Activity changes are already in commit 28a26a8 ("feat: add activity screen
+  with pagination"). I reviewed the committed versions of
+  src/hooks/useActivity.ts, src/app/activity.tsx,
+  src/components/ActivityRow.tsx, src/api/activity.ts and src/money/format.ts. I
+  did not read the tests, parse.ts internals, decimal.ts internals, NOTES.md or
+  README.md. I did not run tsc, lint or tests.
+
+  Nothing serious found. I found no race, stuck-loading or money bugs.
+
+  What I checked:
+  - **Load more after refresh:** the generation ref is bumped in the effect, and
+  `loadingMore.current` is reset there. A stale load-more response is dropped
+  in both the success and error paths, and the stale `finally` doesn't clobber
+  the new flag. This is correct.
+  - **Refresh failure with items on screen:** `loading` and `refreshing` are
+  cleared, the items stay, and a banner shows. This is correct.
+  - **Retry from the first-page error:** it resets to INITIAL (`loading: true`)
+  and bumps `reloadCount`, so it can't get stuck.
+  - **`onEndReached` on web:** it can fire repeatedly when the content is
+  shorter than the viewport. The `loadingMore` ref guard makes that harmless.
+  After a load-more error, `onEndReached` is set to undefined, so a failing
+  request can't loop. The footer retry calls `loadMore` directly, which clears
+  `moreError`.
+  - **Duplicates:** `appendUnique` dedupes by `id`, so shifted pages don't
+  produce duplicate `keyExtractor` keys.
+  - **Money and sign:** all amounts go through `compare`, `ZERO` and
+  `formatAmount`, which use BigInt with no float conversion. Negatives are
+  handled via the `-` prefix, and positives get `+`. A zero amount displays
+  without a sign, which is fine.
+
+  Minor items, in order of importance:
+  1. `src/components/ActivityRow.tsx:52`: `style={[styles.status, { color:
+  STATUS_COLOR[item.status] }]}` is an inline style object in render, which
+  breaks the AGENTS.md rule. Minimal fix: build `StyleSheet.create({ pending:
+  {color: colors.warning}, confirmed: ..., completed: ..., failed: ... })` and
+  use `statusStyles[item.status]`. This is cosmetic, but the rule is explicit.
+  2. `src/hooks/useActivity.ts:44-56`: if the token is missing, the hook still
+  fires an unauthenticated request before the screen's `<Redirect>` runs
+  (`activity.tsx:16`). The result is a wasted call and an error that is never
+  shown. Fix if you have time: skip the fetch when `!getToken()`. Otherwise
+  ignore it.
+  3. `src/hooks/useActivity.ts:44`: the fetch has no AbortController. A response
+  after unmount is harmless in React 18+ and the generation check covers
+  refresh, so this is not a bug.
+  4. `src/app/activity.tsx:41`: `renderItem` and `keyExtractor` are inline
+  functions. React Compiler covers this, so I'm not flagging it.
+
+  The Refresh button and the `RefreshControl` both call `refresh`. On web only
+  the button works, which is fine.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Agent "Review activity changes" finished · 31s
+
+⏺ The reviewer found nothing serious in the Activity code. It's 13:46 and your
+  tree is clean, so it reviewed the committed version (28a26a8).
+
+  What it confirmed is correct:
+  - A "Load more" response that arrives after a refresh is dropped, both when it
+    succeeds and when it fails.
+  - Neither a failed refresh nor Retry can leave the screen stuck loading.
+  - On web, onEndReached fires repeatedly when the list is shorter than the
+    screen, but the guard makes that harmless. After a "Load more" error it is
+    switched off, so a failing request can't loop.
+  - Duplicates are filtered by id.
+  - Signed amounts go through BigInt only, with no float conversion.
+
+  Minor findings:
+  1. Inline style object in render, which breaks the AGENTS.md rule
+     (ActivityRow.tsx:52 (src/components/ActivityRow.tsx#L52)). The status
+     colour is passed as { color: STATUS_COLOR[item.status] }. The fix is a
+     StyleSheet keyed by status, the way RecentClaims.tsx
+     (src/components/RecentClaims.tsx) already does it. Purely a rule violation;
+     about 2 minutes.
+  2. A request goes out with no token before the redirect (useActivity.ts:44
+     (src/hooks/useActivity.ts#L44)). Opening /activity without a token sends
+     one request that will fail, and its error is never shown. It's wasted, not
+     wrong. Home behaves the same way.
+  3. No abort on unmount. The reviewer says this is harmless, not a bug.
+
+  My recommendation: fix #1 now, because the rule is explicit and reviewers
+  check it. That's one small commit (style: use stylesheet for activity status
+  colors) and a redeploy before 14:00, which leaves about 10 minutes of margin.
+  I'd leave #2 and #3 as they are.
+
+  Should I make the #1 fix?
+
+❯ fix
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/components/ActivityRow.tsx)
+  ⎿  Removed 7 lines
+       5  import { formatAmount } from '@/money/format';
+       6  import { ActivityItem, ActivityStatus } from '@/types/api';
+       7  
+       8 -const STATUS_COLOR: Record<ActivityStatus, string> = {         
+       9 -  pending: colors.warning,                                     
+      10 -  confirmed: colors.success,                                   
+      11 -  completed: colors.success,                                   
+      12 -  failed: colors.danger,                                       
+      13 -};                                                             
+      14 -                                                               
+       8  const STATUS_LABEL: Record<ActivityStatus, string> = {
+       9    pending: 'Pending',
+      10    confirmed: 'Confirmed',
+
+⏺ Update(src/components/ActivityRow.tsx)
+  ⎿  Added 1 line, removed 1 line
+      42          <Text style={[styles.amount, negative && styles.negativ
+          e, item.status === 'failed' && styles.struck]}>
+      43            {signedAmount(item)} {item.asset}
+      44          </Text>
+      45 -        <Text style={[styles.status, { color: STATUS_COLOR[item
+         -.status] }]}>{STATUS_LABEL[item.status]}</Text>                
+      45 +        <Text style={[styles.status, statusStyles[item.status]]
+         +}>{STATUS_LABEL[item.status]}</Text>                           
+      46        </View>
+      47      </View>
+      48    );
+
+⏺ Update(src/components/ActivityRow.tsx)
+  ⎿  Added 7 lines
+      67    struck: { textDecorationLine: 'line-through', color: colors.t
+          extMuted },
+      68    status: { fontSize: fontSize.sm },
+      69  });
+      70 +                                                               
+      71 +const statusStyles = StyleSheet.create<Record<ActivityStatus, {
+         + color: string }>>({                                           
+      72 +  pending: { color: colors.warning },                          
+      73 +  confirmed: { color: colors.success },                        
+      74 +  completed: { color: colors.success },                        
+      75 +  failed: { color: colors.danger },                            
+      76 +});                                                            
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I fixed the inline style in ActivityRow.tsx (src/components/ActivityRow.tsx):
+  the status colours now come from a StyleSheet keyed by status
+  (statusStyles[item.status]), the same pattern as RecentClaims. The colours
+  stay the same. 109/109 tests pass, and tsc and eslint are clean.
+
+  Browser check: on Activity, the statuses should still be orange for Pending,
+  green for Confirmed/Completed and red for Failed.
+
+  git add src/components/ActivityRow.tsx
+  git commit -m "style: use stylesheet for activity status colors"
+
+  It's 13:47. Commit and redeploy before 14:00, and after that nothing more goes
+  out.
+❯ <ide_opened_file>The user opened the file
+  /Users/vladislav/Projects/test/payback-app/src/components/ActivityRow.tsx in
+  the IDE. This may or may not be related to the current
+  task.</ide_opened_file>
+
+❯ run tests
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All 109 tests pass across 10 suites, and npx tsc --noEmit is clean.
+
+  The style fix in src/components/ActivityRow.tsx isn't committed yet. It's
+  13:48, which leaves 12 minutes before the 14:00 cut-off for committing and
+  redeploying:
+
+  git add src/components/ActivityRow.tsx
+  git commit -m "style: use stylesheet for activity status colors"

@@ -5,13 +5,6 @@ import { compare, ZERO } from '@/money/decimal';
 import { formatAmount } from '@/money/format';
 import { ActivityItem, ActivityStatus } from '@/types/api';
 
-const STATUS_COLOR: Record<ActivityStatus, string> = {
-  pending: colors.warning,
-  confirmed: colors.success,
-  completed: colors.success,
-  failed: colors.danger,
-};
-
 const STATUS_LABEL: Record<ActivityStatus, string> = {
   pending: 'Pending',
   confirmed: 'Confirmed',
@@ -49,7 +42,7 @@ export function ActivityRow({ item }: { item: ActivityItem }) {
         <Text style={[styles.amount, negative && styles.negative, item.status === 'failed' && styles.struck]}>
           {signedAmount(item)} {item.asset}
         </Text>
-        <Text style={[styles.status, { color: STATUS_COLOR[item.status] }]}>{STATUS_LABEL[item.status]}</Text>
+        <Text style={[styles.status, statusStyles[item.status]]}>{STATUS_LABEL[item.status]}</Text>
       </View>
     </View>
   );
@@ -73,4 +66,11 @@ const styles = StyleSheet.create({
   negative: { color: colors.text },
   struck: { textDecorationLine: 'line-through', color: colors.textMuted },
   status: { fontSize: fontSize.sm },
+});
+
+const statusStyles = StyleSheet.create<Record<ActivityStatus, { color: string }>>({
+  pending: { color: colors.warning },
+  confirmed: { color: colors.success },
+  completed: { color: colors.success },
+  failed: { color: colors.danger },
 });
