@@ -21,6 +21,16 @@ npx expo-doctor             # diagnose dependency and config issues
 npx expo install --fix      # fix incompatible package versions
 ```
 
+## Structure
+
+- `app/` — routes only (expo-router). Keep screens thin, move logic out.
+- `src/api/` — one API client, typed request functions, nothing else talks to fetch directly
+- `src/hooks/` — data fetching and screen logic
+- `src/components/` — reusable UI
+- `src/types/` — shared types, API response types
+- `src/utils/` — pure helpers
+- tests next to the code: `foo.ts` → `foo.test.ts`
+
 ## Code style
 
 - TypeScript strict. No `any`, no `@ts-ignore`. Types come from the API docs.

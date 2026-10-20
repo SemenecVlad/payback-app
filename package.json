@@ -32,15 +32,20 @@
   "devDependencies": {
     "@testing-library/react-native": "^14.1.0",
     "@types/react": "~19.3.0",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "@types/jest": "~30.0.0"
   },
   "scripts": {
     "start": "expo start",
-    "reset-project": "node ./scripts/reset-project.js",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "test": "jest",
+    "typecheck": "tsc --noEmit"
   },
-  "private": true
+  "private": true,
+  "jest": {
+    "preset": "jest-expo"
+  }
 }
