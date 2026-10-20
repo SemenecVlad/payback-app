@@ -1,0 +1,2901 @@
+
+❯ Hey, timed take-home, deadline is 14:00 UTC, so we have about 1h45m. Rules
+  are in CLAUDE.md and AGENTS.md, read them first and stick to them.
+
+  Context: a slice of a crypto cashback app ("payback"). Users see payback
+  balances and claim them. It's real money for users, so correctness matters
+  more than polish. Expo + TypeScript, shipped as a web build opened on a phone
+  (~390px). Web only, no need for iOS/Android.
+
+  API docs: https://task-api.cashmine.io/docs
+  Read them carefully before planning, especially amount formats, claim rules
+  (min/max, fee, precision), claim statuses, error codes and anything about
+  idempotency or retries. Treat the API as a real remote server we can't
+  change, and assume it can be slow or flaky on purpose. Don't guess anything
+  that's not in the docs, ask me.
+
+  Token rules: the token must never be in the code, the repo or the build. On
+  first open the app asks for it (a text field is fine), keeps it in browser
+  storage and has a way to change it. I'll paste my token into the app myself,
+  never ask me for it here.
+
+  Setup (keep it fast):
+  - npm run reset-project, then remove the reset script and app-example
+  - web output "single" in app.json
+  - jest-expo + @testing-library/react-native
+  - ai-logs/ with a .gitkeep, .gitignore covers .env*, node_modules, dist,
+  .expo
+  - git initialized already
+
+  What to build, in priority order (fewer things done right beats everything
+  half done):
+  1. Home: balances per asset, total in USD, how fresh the data is. Loading,
+  error with retry, refresh.
+  2. Claim: pick asset, enter amount or tap Max, show fee and what they'll
+  receive, confirm, submit, then follow the claim until it completes or fails.
+  Validate input against the rules from the docs.
+  3. Unit tests for the amount logic: parsing, validation, fee, totals.
+  4. Activity with pagination, only if time is left.
+
+  Before coding the claim, I need to decide two things with you, so don't just
+  pick:
+  - How we represent and calculate amounts. Give me options with pros and cons.
+  - What the balance shows right after a claim is submitted. One user said "I
+  claimed and my balance didn't change, so I claimed again", another said "my
+  balance dropped, then jumped back up, and I stopped trusting the app". Give
+  me at least two different approaches with tradeoffs, I'll choose.
+    Also tell me what you suggest for when a claim result is unknown (e.g.
+  timeout), based on what the API supports.
+
+  Timing: I need a commit at least every 30 min, so keep chunks small. We
+  deploy to [Vercel/EAS Hosting] as soon as Home works, not at the end. Around
+  13:35 UTC we stop features and write NOTES.md and README.md.
+
+  Start by reading the docs and giving me a short plan: screens, folder
+  structure, amount approach options, what we'll test. Wait for my ok.
+
+⏺ I'll read the API docs and check the project state first.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Fetch(https://task-api.cashmine.io/docs)
+  ⎿  Received 4.8KB (200 OK)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Docs read (raw text via curl; I didn't rely on the WebFetch summary). A few
+  things to flag before the plan:
+
+  - Time: it's 12:47 UTC, so we have about 1h13m, not 1h45m. With the 13:35
+    freeze that leaves about 48 min of build time. I'd treat Activity as cut and
+    keep Claim as small as possible.
+  - WebFetch made up part of the docs. Its summary added a "Notes and Gaps"
+    section ("fee rounding not specified", etc.) that isn't in the real docs.
+    That could be one of the "Working with AI" moments for NOTES.md.
+  - Docs facts that shape the design: amounts are strict decimal strings. Each
+    asset's decimals comes from /balances. The fee is a fixed amount from
+    /claim-options, and the user receives amount − fee, so no fee rounding is
+    needed. The minimum is minAmount, the maximum is the live available, and
+    there's no separate max. Balances are 15s snapshots with asOf. POST /claims
+    needs an Idempotency-Key, and repeating it with the same body is safe (it
+    returns the original claim). A 504 means "outcome unknown". A pending claim
+    settles in about 20s.
+  - Conflict in AGENTS.md: your uncommitted edit says app/ holds the routes, but
+    the Navigation section says src/app/, and the template uses src/app/. I'll
+    use src/app/ unless you say otherwise.
+
+  Screens
+
+  - Token (src/app/token.tsx): a text field, saved to localStorage via
+    tokenStorage.ts. It opens on first launch and from a "Change token" link. A
+    401 sends you back here.
+  - Home (index.tsx): one row per asset with available, pending and claiming.
+    Shows a USD total, "Updated Xs ago" from asOf, loading, error with retry, an
+    empty state and pull-to-refresh/refresh button.
+  - Claim (claim.tsx?asset=): asset picker, amount field with Max, destination,
+    then fee, "you receive" and validation. Confirm submits, then a status view
+    (pending → completed/failed/unknown).
+  - Activity: only if time is left (realistically no).
+
+  Folder structure
+
+  src/api/ (config, client with timeout and typed errors, balances, claims,
+  tokenStorage) · src/money/ (amount.ts, usd.ts, validateClaim.ts plus tests) ·
+  src/types/api.ts · src/hooks/ (useBalances, useClaimOptions, useClaim) ·
+  src/components/ · the existing src/constants/theme.ts. Plain hooks, no React
+  Query (fewer dependencies, less time).
+
+  Decision 1: how we represent amounts
+
+  - A. BigInt in smallest units (recommended): parse the string into {units:
+    bigint, decimals} and format back to a string, in our own ~80 lines in
+    src/money/.
+    - For: exact, no dependency, works on web, easy to test, and floats can't
+      sneak in.
+    - Against: we write and test parsing and formatting ourselves. The USD total
+      multiplies two scales (amount × price), which needs care.
+  - B. A decimal library (big.js, about 6KB):
+    - For: well tested, has rounding modes.
+    - Against: another dependency to audit for web support. We still have to
+      write strict input parsing, and toNumber() is one call away.
+  - C. Keep strings and let the server do the math:
+    - For: least code.
+    - Against: we can't show the fee/receive amount or check the minimum and
+      available without math. Rejected.
+
+  Decision 2: the balance right after a claim
+
+  - A. Optimistic overlay, cleared by asOf:
+    - How: on 201, show the asset's available as snapshot − amount with a
+      "Claiming 0.5 ETH…" row. The overlay is removed only once a snapshot
+      arrives with asOf ≥ claim.createdAt, because that snapshot already
+      includes the claim. That avoids the "dropped, then jumped back" problem.
+      If the claim fails, we show "Failed: reason, 0.5 ETH returned", so the
+      number going back up has an explanation.
+    - For: fixes both complaints.
+    - Against: client-side money math, and it relies on our reading of how
+      snapshots and asOf behave (which is how the docs describe it). It's a pure
+      function we can unit-test.
+  - B. Server numbers only, plus a visible pending state:
+    - How: never change the numbers locally. Show a "Claim in progress: 0.5 ETH,
+      pending" badge on the asset and block a second claim of that asset until
+      the first settles, then refetch.
+    - For: simplest, never shows a number the server didn't send.
+    - Against: available looks unchanged for up to 15s. The badge and the block
+      address the "claimed again" complaint, but a user could still be confused
+      for that window.
+  - C. Server numbers plus a separate "after pending claims" line: keep the
+    server's available as is, and show an estimated "≈ 0.32 after claim" line
+    underneath until the snapshot catches up.
+    - For: honest about what's estimated.
+    - Against: two numbers on a 390px screen, and as much code as A.
+
+  I'd pick A if the claim flow lands quickly and B if we're short on time. Your
+  call.
+
+  My suggestion for an unknown claim result (504, network error, 5xx, timeout)
+
+  - Idempotency key: generated once per confirmed request and reused for every
+    retry. The form is locked while the outcome is unknown, so the amount can't
+    be changed and a second claim can't be created under a new key.
+  - Retries: on 504, network failure or 500/503, show "Checking your claim…"
+    (not "failed") and automatically repeat the same POST with the same key 2–3
+    times with backoff. A 429 waits retryAfterMs. A replay (200) or 201 gives us
+    the claim id.
+  - Still unknown after that: show "We couldn't confirm your claim. Don't claim
+    again, it may still go through," with a "Check again" button that repeats
+    the POST with the same key.
+  - Once we have an id: poll GET /claims/{id} every 2s. After about 30s, show
+    "Taking longer than usual" and let the user refresh by hand.
+  - Definite outcomes: 400 means a real rejection with readable text, and the
+    form unlocks. 401 goes to the token screen. 409 shows a message only.
+  - Risk: reloading the page drops the key. If there's time, I'll keep the
+    in-flight attempt in localStorage.
+
+  Tests
+
+  Amount parsing:
+  - "0.5" and "12" pass; ".5", "1.", "05", "1e-3", "-1", "0", spaces/junk and
+    too many decimals are rejected
+  - a comma counts as the decimal separator; thousands separators are rejected
+
+  Claim validation and maths:
+  - below the minimum, above available, receive ≤ 0
+  - fee and receive amount; Max fills in the full available
+  - USD total
+  - the balance overlay (if we pick A)
+  - the claim-state transitions, if time allows
+
+  Questions
+
+  1. Hosting: the brief says "[Vercel/EAS Hosting]". Which one? I'd pick EAS
+     Hosting (npx expo export -p web + eas deploy). Either way you'll need to
+     log in to the CLI yourself.
+  2. USD total: is it the USD value of available only (with pending shown
+     separately), or available + pending + claiming? The docs don't say. I'd use
+     available only. Display is 2 decimals, rounded half-up.
+  3. Decision 1: A/B, and Decision 2: A/B/C.
+
+  Order once you say ok
+
+  1. Setup (reset-project, "single" output, .gitignore → .env*,
+     ai-logs/.gitkeep; jest-expo and RNTL are already installed), then commit.
+  2. Money module + tests + API client + token screen, then commit.
+  3. Home + deploy, then commit around 13:10.
+  4. Claim, then commit around 13:30.
+  5. NOTES.md and README.md at 13:35.
+
+❯ decision 1: A
+  decision 2: A
+  all other - approve
+
+⏺ Going with BigInt amounts, the optimistic overlay cleared by asOf, EAS
+  Hosting, a USD total of available only, and src/app/. Starting setup now:
+  reset-project, web output "single", .gitignore, ai-logs/, Jest config, then
+  NOTES.md with the decisions.
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ Bash(echo n | npm run reset-project 2>&1 | tail -15; ls -R src scripts 2>&1 |
+      head; ls)
+  ⎿  Deleted scripts/reset-project.js (+0 -145)
+        1 -#!/usr/bin/env node                                           
+        2 -                                                              
+        3 -/**                                                           
+        4 - * This script is used to reset the project to a blank state. 
+        5 - * It deletes or moves the /src and /scripts directories to /e
+          -xample based on user input and creates a new /src/app director
+          -y with an index.tsx and _layout.tsx file.                     
+        6 - * Demo images in /assets/images are deleted or moved along wi
+          -th them.                                                      
+        7 - * You can remove the `reset-project` script from package.json
+          - and safely delete this file after running it.                
+        8 - */                                                           
+        9 -                                                              
+       10 -const fs = require("fs");                                     
+       11 -const path = require("path");                                 
+       12 -const readline = require("readline");                         
+       13 -                                                              
+       14 -const root = process.cwd();                                   
+       15 -const oldDirs = ["src", "scripts"];                           
+       16 -const exampleDir = "example";                                 
+       17 -const newAppDir = "src/app";                                  
+       18 -const exampleDirPath = path.join(root, exampleDir);           
+       19 -// Demo images and folders used only by the files in /src     
+       20 -const exampleAssets = [                                       
+       21 -  "expo-badge.png",                                           
+       22 -  "expo-badge-white.png",                                     
+       23 -  "expo-logo.png",                                            
+       24 -  "logo-glow.png",                                            
+       25 -  "react-logo.png",                                           
+       26 -  "react-logo@2x.png",                                        
+       27 -  "react-logo@3x.png",                                        
+       28 -  "tutorial-web.png",                                         
+       29 -  "tabIcons",                                                 
+       30 -];                                                            
+       31 -                                                              
+       32 -const indexContent = `import { Text, View, StyleSheet } from "
+          -react-native";                                                
+       33 -                                                              
+       34 -export default function Index() {                             
+       35 -  return (                                                    
+       36 -    <View style={styles.container}>                           
+       37 -      <Text>Edit src/app/index.tsx to edit this screen.</Text>
+       38 -    </View>                                                   
+       39 -  );                                                          
+       40 -}                                                             
+     … 105 more lines (ctrl+o to expand)
+  ⎿  Updated src/app/_layout.tsx (+3 -16)
+       1 -import { DarkTheme, DefaultTheme, ThemeProvider } from 'expo-ro
+         -uter';                                                         
+       2 -import * as SplashScreen from 'expo-splash-screen';            
+       3 -import { useColorScheme } from 'react-native';                 
+       1 +import { Stack } from "expo-router";                           
+       2  
+       5 -import { AnimatedSplashOverlay } from '@/components/animated-ic
+         -on';                                                           
+       6 -import AppTabs from '@/components/app-tabs';                   
+       7 -                                                               
+       8 -SplashScreen.preventAutoHideAsync();                           
+       9 -                                                               
+      10 -export default function TabLayout() {                          
+      11 -  const colorScheme = useColorScheme();                        
+      12 -  return (                                                     
+      13 -    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : 
+         -DefaultTheme}>                                                 
+      14 -      <AnimatedSplashOverlay />                                
+      15 -      <AppTabs />                                              
+      16 -    </ThemeProvider>                                           
+      17 -  );                                                           
+       3 +export default function RootLayout() {                         
+       4 +  return <Stack />;                                            
+       5  }
+  ⎿  Deleted src/app/explore.tsx (+0 -180)
+        1 -import { Image } from 'expo-image';                           
+        2 -import { SymbolView } from 'expo-symbols';                    
+        3 -import { Platform, Pressable, ScrollView, StyleSheet } from 'r
+          -eact-native';                                                 
+        4 -import { useSafeAreaInsets } from 'react-native-safe-area-cont
+          -ext';                                                         
+        5 -                                                              
+        6 -import { ExternalLink } from '@/components/external-link';    
+        7 -import { ThemedText } from '@/components/themed-text';        
+        8 -import { ThemedView } from '@/components/themed-view';        
+        9 -import { Collapsible } from '@/components/ui/collapsible';    
+       10 -import { WebBadge } from '@/components/web-badge';            
+       11 -import { BottomTabInset, MaxContentWidth, Spacing } from '@/co
+          -nstants/theme';                                               
+       12 -import { useTheme } from '@/hooks/use-theme';                 
+       13 -                                                              
+       14 -export default function TabTwoScreen() {                      
+       15 -  const safeAreaInsets = useSafeAreaInsets();                 
+       16 -  const insets = {                                            
+       17 -    ...safeAreaInsets,                                        
+       18 -    bottom: safeAreaInsets.bottom + BottomTabInset + Spacing.t
+          -hree,                                                         
+       19 -  };                                                          
+       20 -  const theme = useTheme();                                   
+       21 -                                                              
+       22 -  const contentPlatformStyle = Platform.select({              
+       23 -    android: {                                                
+       24 -      paddingTop: insets.top,                                 
+       25 -      paddingLeft: insets.left,                               
+       26 -      paddingRight: insets.right,                             
+       27 -      paddingBottom: insets.bottom,                           
+       28 -    },                                                        
+       29 -    web: {                                                    
+       30 -      paddingTop: Spacing.six,                                
+       31 -      paddingBottom: Spacing.four,                            
+       32 -    },                                                        
+       33 -  });                                                         
+       34 -                                                              
+       35 -  return (                                                    
+       36 -    <ScrollView                                               
+       37 -      style={[styles.scrollView, { backgroundColor: theme.back
+          -ground }]}                                                    
+       38 -      contentInset={insets}                                   
+       39 -      contentContainerStyle={[styles.contentContainer, content
+          -PlatformStyle]}>                                              
+       40 -      <ThemedView style={styles.container}>                   
+     … 140 more lines (ctrl+o to expand)
+  ⎿  Updated src/app/index.tsx (+7 -88)
+       1 -import * as Device from 'expo-device';                         
+       2 -import { Platform, StyleSheet } from 'react-native';           
+       3 -import { SafeAreaView } from 'react-native-safe-area-context'; 
+       1 +import { Text, View, StyleSheet } from "react-native";         
+       2  
+       5 -import { AnimatedIcon } from '@/components/animated-icon';     
+       6 -import { HintRow } from '@/components/hint-row';               
+       7 -import { ThemedText } from '@/components/themed-text';         
+       8 -import { ThemedView } from '@/components/themed-view';         
+       9 -import { WebBadge } from '@/components/web-badge';             
+      10 -import { BottomTabInset, MaxContentWidth, Spacing } from '@/con
+         -stants/theme';                                                 
+      11 -                                                               
+      12 -function getDevMenuHint() {                                    
+      13 -  if (Platform.OS === 'web') {                                 
+      14 -    return <ThemedText type="small">use browser devtools</Theme
+         -dText>;                                                        
+      15 -  }                                                            
+      16 -  if (Device.isDevice) {                                       
+      17 -    return (                                                   
+      18 -      <ThemedText type="small">                                
+      19 -        shake device or press <ThemedText type="code">m</Themed
+         -Text> in terminal                                              
+      20 -      </ThemedText>                                            
+      21 -    );                                                         
+      22 -  }                                                            
+      23 -  const shortcut = Platform.OS === 'android' ? 'cmd+m (or ctrl+
+         -m)' : 'cmd+d';                                                 
+      24 -  return (                                                     
+      25 -    <ThemedText type="small">                                  
+      26 -      press <ThemedText type="code">{shortcut}</ThemedText>    
+      27 -    </ThemedText>                                              
+      28 -  );                                                           
+      29 -}                                                              
+      30 -                                                               
+      31 -export default function HomeScreen() {                         
+       3 +export default function Index() {                              
+       4    return (
+      33 -    <ThemedView style={styles.container}>                      
+      34 -      <SafeAreaView style={styles.safeArea}>                   
+      35 -        <ThemedView style={styles.heroSection}>                
+      36 -          <AnimatedIcon />                                     
+      37 -          <ThemedText type="title" style={styles.title}>       
+      38 -            Welcome to&nbsp;Expo                               
+     … 65 more lines (ctrl+o to expand)
+  ⎿  Deleted src/components/animated-icon.module.css (+0 -6)
+      1 -.expoLogoBackground {                                           
+      2 -  background-image: linear-gradient(180deg, #3c9ffe, #0274df);  
+      3 -  border-radius: 40px;                                          
+      4 -  width: 128px;                                                 
+      5 -  height: 128px;                                                
+      6 -}                                                               
+  ⎿  … 29 more files changed
+
+⏺ Bash(ls -R assets && cat src/app/_layout.tsx src/app/index.tsx && node -e '
+      const fs=require("fs");…)
+  ⎿  Created ai-logs/.gitkeep (+0 -0)
+  ⎿  Updated .gitignore (+1 -1)
+      31  *.pem
+      32  
+      33  # local env files
+      34 -.env*.local                                                    
+      34 +.env*                                                          
+      35  
+      36  # typescript
+      37  *.tsbuildinfo
+  ⎿  Updated app.json (+1 -1)
+      20        "predictiveBackGestureEnabled": false
+      21      },
+      22      "web": {
+      23 -      "output": "server",                                      
+      23 +      "output": "single",                                      
+      24        "favicon": "./assets/images/favicon.png"
+      25      },
+      26      "plugins": [
+  ⎿  Updated package.json (+7 -3)
+      36    },
+      37    "scripts": {
+      38      "start": "expo start",
+      39 -    "reset-project": "node ./scripts/reset-project.js",        
+      39      "android": "expo start --android",
+      40      "ios": "expo start --ios",
+      41      "web": "expo start --web",
+      43 -    "lint": "expo lint"                                        
+      42 +    "lint": "expo lint",                                       
+      43 +    "test": "jest",                                            
+      44 +    "typecheck": "tsc --noEmit"                                
+      45    },
+      45 -  "private": true                                              
+      46 +  "private": true,                                             
+      47 +  "jest": {                                                    
+      48 +    "preset": "jest-expo"                                      
+      49 +  }                                                            
+      50  }
+
+⏺ Setup is done. Next I'm writing the money module (BigInt Decimal with parse,
+  math, rounding and formatting), user-input parsing, claim validation and the
+  USD total, with tests.
+
+⏺ Write(src/money/decimal.ts)
+  ⎿  Wrote 79 lines to src/money/decimal.ts
+      1 /**
+      2  * Exact decimal numbers: `units / 10^scale`, with `units` a BigI
+        nt.
+         amounts.
+      4  */
+      5 export type Decimal = { readonly units: bigint; readonly scale: n
+        umber };
+      7 const API_FORMAT = /^(0|[1-9]\d*)(\.\d+)?$/;
+      8
+      9 export const ZERO: Decimal = { units: 0n, scale: 0 };
+     … +79 lines (ctrl+o to expand)
+
+⏺ Write(src/money/amountInput.ts)
+  ⎿  Wrote 29 lines to src/money/amountInput.ts
+       1 import { Decimal } from './decimal';
+       2
+       3 export type AmountInputError = 'empty' | 'invalid' | 'negative'
+       4
+       5 export type AmountInputResult =
+       6   | { ok: true; value: Decimal }
+       7   | { ok: false; error: AmountInputError };
+       9 // One decimal separator, digits only. "1." and ".5" are accepte
+         d while typing; output is canonical anyway.
+      10 const INPUT_FORMAT = /^(\d+\.?\d*|\.\d+)$/;
+     … +28 lines (ctrl+o to expand)
+
+⏺ Write(src/money/claimAmount.ts)
+  ⎿  Wrote 56 lines to src/money/claimAmount.ts
+       1 import { parseAmountInput } from './amountInput';
+       2 import { compare, Decimal, isZero, sub, toApiString } from './de
+         cimal';
+       3
+       4 export type ClaimRules = {
+       6   decimals: number;
+       7   available: Decimal;
+       8   minAmount: Decimal;
+       9   fee: Decimal;
+      10 };
+     … +57 lines (ctrl+o to expand)
+
+⏺ Write(src/money/usd.ts)
+  ⎿  Wrote 17 lines to src/money/usd.ts
+       1 import { add, Decimal, mul, toFixed, ZERO } from './decimal';
+       2
+       3 type Priced = { amount: Decimal; usdPrice: Decimal };
+       5 /** Exact sum of amount × price; rounding happens only once, whe
+         n formatting. */
+       6 export function usdTotal(items: Priced[]): Decimal {
+       7   return items.reduce((sum, item) => add(sum, mul(item.amount, i
+       8 }
+       9
+      10 /** "$1,234.57", rounded half up to cents. */
+     … +10 lines (ctrl+o to expand)
+
+⏺ Write(src/money/decimal.test.ts)
+  ⎿  Wrote 58 lines to src/money/decimal.test.ts
+       1 import { add, compare, mul, parseDecimal, roundHalfUp, sub, toAp
+         iString, toFixed } from './decimal';
+       2
+       4   const parsed = parseDecimal(value);
+       5   if (!parsed) throw new Error(`bad test value ${value}`);
+       6   return parsed;
+       7 };
+       9 describe('parseDecimal', () => {
+      10   it.each(['0', '12', '0.5', '820.413207', '0.000001'])('accepts
+          %s', (value) => {
+     … +53 lines (ctrl+o to expand)
+
+⏺ Write(src/money/claimAmount.test.ts)
+  ⎿  Wrote 101 lines to src/money/claimAmount.test.ts
+      1 import { parseAmountInput } from './amountInput';
+      2 import { checkClaimAmount, ClaimRules, maxClaimInput } from './cl
+        aimAmount';
+      3 import { parseDecimal, toApiString } from './decimal';
+      4
+      5 const d = (value: string) => {
+      6   const parsed = parseDecimal(value);
+      7   if (!parsed) throw new Error(`bad test value ${value}`);
+      8   return parsed;
+      9 };
+     … +99 lines (ctrl+o to expand)
+
+⏺ Write(src/money/usd.test.ts)
+  ⎿  Wrote 34 lines to src/money/usd.test.ts
+       1 import { parseDecimal } from './decimal';
+       2 import { formatUsd, usdTotal } from './usd';
+       3
+       4 const d = (value: string) => {
+       5   const parsed = parseDecimal(value);
+       6   if (!parsed) throw new Error(`bad test value ${value}`);
+       7   return parsed;
+       8 };
+       9
+      10 describe('usdTotal', () => {
+     … +25 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+❯ after setup stop and suggest commit before moving to next phase
+
+⏺ I'll pause here, since setup is complete and I've already written the money
+  module—so I'll suggest two commits instead of one. First I'll log the
+  decisions in NOTES.md as CLAUDE.md requires, then run the typecheck.
+
+⏺ Write(NOTES.md)
+  ⎿  Wrote 39 lines to NOTES.md
+       1 # Notes
+       3 ## Decisions
+       4
+       6 Amounts are parsed from the API's decimal strings into `{ units:
+          bigint, scale }` and all math
+         . Floats are never used.
+       8 USD total is summed exactly and rounded once, half up, to cents
+       9 - Alternatives: a decimal library (`big.js`) — well tested, but
+         another dependency to audit for web,
+          call away; keeping strings and doing
+     … +51 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ tsc is failing because @types/jest is missing, so I'm adding it as a dev
+  dependency.
+
+⏺ Bash(npx expo install @types/jest -- --save-dev 2>&1 | tail -3 && npx tsc
+      --noEmit; echo "tsc exit $?"; npx jest 2>&1 | tail -4)  ⎿  Updated package-lock.json (+56 -0)
+       9        "version": "1.0.0",
+      10        "dependencies": {
+      11          "@expo/ui": "~58.0.21",
+      12 +        "@types/jest": "30.0.0",                               
+      13          "expo": "~58.0.16",
+      14          "expo-constants": "~58.0.12",
+      15          "expo-device": "~58.0.5",
+     ...
+      5101          "@types/istanbul-lib-report": "*"
+      5102        }
+      5103      },
+      5104 +    "node_modules/@types/jest": {                            
+      5105 +      "version": "30.0.0",                                   
+      5106 +      "resolved": "https://registry.npmjs.org/@types/jest/-/j
+           +est-30.0.0.tgz",                                             
+      5107 +      "integrity": "sha512-XTYugzhuwqWjws0CVz8QpM36+T+Dz5mTEB
+           +KhNs/esGLnCIlGdRy+Dq78NRjd7ls7r8BC8ZRMOrKlkO1hU0JOwA==",     
+      5108 +      "license": "MIT",                                      
+      5109 +      "dependencies": {                                      
+      5110 +        "expect": "^30.0.0",                                 
+      5111 +        "pretty-format": "^30.0.0"                           
+      5112 +      }                                                      
+      5113 +    },                                                       
+      5114 +    "node_modules/@types/jest/node_modules/@jest/schemas": { 
+      5115 +      "version": "30.5.0",                                   
+      5116 +      "resolved": "https://registry.npmjs.org/@jest/schemas/-
+           +/schemas-30.5.0.tgz",                                        
+      5117 +      "integrity": "sha512-/hunigyNpc4RCjC0VaW3f5RCUZVM2+WQ65
+           +qP7z083Gmvac7or2LI50XVNOtE4YPgBpV0yxYiAgorAPGniCoJmg==",     
+      5118 +      "license": "MIT",                                      
+      5119 +      "dependencies": {                                      
+      5120 +        "@sinclair/typebox": "^0.34.0"                       
+      5121 +      },                                                     
+      5122 +      "engines": {                                           
+      5123 +        "node": "^18.14.0 || ^20.0.0 || ^22.0.0 || >=24.0.0" 
+      5124 +      }                                                      
+      5125 +    },                                                       
+      5126 +    "node_modules/@types/jest/node_modules/@sinclair/typebox"
+           +: {                                                          
+      5127 +      "version": "0.34.52",                                  
+      5128 +      "resolved": "https://registry.npmjs.org/@sinclair/typeb
+           +ox/-/typebox-0.34.52.tgz",                                   
+      5129 +      "integrity": "sha512-XiMQh7qqVlxZzcVD+kkGMNGMzcTrDMLWI7
+           +S4x7z1MkCkbDPrekpZXEUK0eZqZFMuHQg2a2DZOcDIh9o5v3Gonw==",     
+      5130 +      "license": "MIT"                                       
+      5131 +    },                                                       
+      5132 +    "node_modules/@types/jest/node_modules/ansi-styles": {   
+      5133 +      "version": "5.2.0",                                    
+     … 28 more lines (ctrl+o to expand)
+  ⎿  Updated package.json (+1 -0)
+       4    "main": "expo-router/entry",
+       5    "dependencies": {
+       6      "@expo/ui": "~58.0.21",
+       7 +    "@types/jest": "30.0.0",                                   
+       8      "expo": "~58.0.16",
+       9      "expo-constants": "~58.0.12",
+      10      "expo-device": "~58.0.5",
+  ⎿  (timeout 5m)
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ The types landed under dependencies, so I'll move them to devDependencies. TS
+  6 also defaults types to [], so they have to be listed in tsconfig.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Bash(node -e '
+      const fs=require("fs");…)
+  ⎿  Updated package.json (+2 -2)
+       4    "main": "expo-router/entry",
+       5    "dependencies": {
+       6      "@expo/ui": "~58.0.21",
+       7 -    "@types/jest": "30.0.0",                                   
+       7      "expo": "~58.0.16",
+       8      "expo-constants": "~58.0.12",
+       9      "expo-device": "~58.0.5",
+     ...
+      32    "devDependencies": {
+      33      "@testing-library/react-native": "^14.1.0",
+      34      "@types/react": "~19.3.0",
+      36 -    "typescript": "~6.0.3"                                     
+      35 +    "typescript": "~6.0.3",                                    
+      36 +    "@types/jest": "~30.0.0"                                   
+      37    },
+      38    "scripts": {
+      39      "start": "expo start",
+  ⎿  Updated tsconfig.json (+4 -1)
+       9        "@/assets/*": [
+      10          "./assets/*"
+      11        ]
+      12 -    }                                                          
+      12 +    },                                                         
+      13 +    "types": [                                                 
+      14 +      "jest"                                                   
+      15 +    ]                                                          
+      16    },
+      17    "include": [
+      18      "**/*.ts",
+
+⏺ I've stopped here. Tests pass (60/60) and npx tsc --noEmit is clean. It's
+  about 13:00 UTC.
+
+  The money module is already written as well, so I suggest two commits, in this
+  order.
+
+  Commit 1: setup
+  - Ran reset-project (example files deleted; the reset script and its npm
+    script are gone).
+  - Changed web output to "single" in app.json.
+  - Widened .gitignore from .env*.local to .env*.
+  - Added ai-logs/.gitkeep.
+  - Added the jest preset and test/typecheck scripts.
+  - Added @types/jest as a dev dependency. TypeScript 6 no longer picks up
+    @types automatically, so I also added "types": ["jest"] to tsconfig.json.
+  - Your own AGENTS.md edit is still uncommitted; it fits here if you want it
+    in.
+
+  git add .gitignore AGENTS.md app.json package.json package-lock.json
+  tsconfig.json ai-logs assets scripts src/app src/components src/constants
+  src/global.css src/hooks
+  Message: chore: reset template, configure jest and single web output
+
+  Commit 2: money module and decisions
+  - src/money/decimal.ts: exact math on BigInt (parse the API format,
+    add/subtract/multiply/compare, round half up, format).
+  - amountInput.ts: strict parsing of what the user types (comma read as decimal
+    point; junk, signs, exponents, thousands separators and too many decimals
+    rejected).
+  - claimAmount.ts: checks minimum, available, decimals and that the amount
+    covers the fee; works out the receive amount and the Max value.
+  - usd.ts: exact USD total, rounded once when formatted.
+  - 60 tests across the three test files.
+  - NOTES.md → Decisions, with all three decisions and the assumptions.
+
+  git add src/money NOTES.md
+  Message: feat: add bigint money module with claim amount validation
+
+  Things you should know:
+  - Lockfile: a hook blocked plain npm install, so package-lock.json still lists
+    @types/jest as a regular dependency, not a dev one. Nothing breaks.
+  - Comma risk: "1,000" is read as 1.000, not one thousand. It's in NOTES.md;
+    the confirm step will show the parsed amount before submitting.
+
+  Next, after your ok: the API client (timeouts, typed errors, checking
+  responses), the token screen, then Home and the deploy.
+
+❯ ok, do the commits
+  then after each phase pause and let me verify the code you written, suggest
+  commit messages on changes
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I didn't make the commits: the permission system blocked the git commit call,
+  which matches CLAUDE.md's "never run git commit yourself". Please run these
+  yourself:
+
+  git add .gitignore AGENTS.md app.json package.json package-lock.json
+  tsconfig.json ai-logs assets scripts src/app src/components src/constants
+  src/global.css src/hooks
+  git commit -m "chore: reset template, configure jest and single web output"
+
+  git add src/money NOTES.md
+  git commit -m "feat: add bigint money module with claim amount validation"
+
+  Next phase, once you confirm: the API client, the token screen and the theme.
+  - API client:
+    - It lives in src/api/ and is the only code that calls fetch.
+    - Every request has a timeout and turns failures into typed errors,
+      including network/timeout as "outcome unknown".
+    - It checks the shape of /balances and converts amounts to Decimal.
+  - Token screen: tokenStorage.ts keeps the token in localStorage, and
+    src/app/token.tsx lets you enter or change it.
+  - Theme: colors and spacing go in src/constants/theme.ts.
+
+  I'll pause after that for you to review the code.
+
+❯ use opened terminal with CASHMINE_TOKEN configured inside
+
+⏺ I'll check whether my shell can see the token (without printing it) and
+  whether the commits went in.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Both commits are in. My shell can't access $CASHMINE_TOKEN, so please run the
+  balances/claim-options curl commands in your terminal and paste the
+  output—meanwhile I'll build out the API layer, domain types, theme, and token
+  screen from the docs.
+
+⏺ Write(src/api/config.ts)
+  ⎿  Wrote 6 lines to src/api/config.ts
+      1 export const API_BASE_URL = 'https://task-api.cashmine.io';
+      2
+      3 export const REQUEST_TIMEOUT_MS = 15_000;
+      4
+      5 /** GET requests are retried on transient failures; POST /claims
+        has its own retry logic (idempotency key). */
+      6 export const GET_RETRY_ATTEMPTS = 2;
+
+⏺ Write(src/api/tokenStorage.ts)
+  ⎿  Wrote 37 lines to src/api/tokenStorage.ts
+       1 const TOKEN_KEY = 'cashmine.token';
+       2
+       3 // localStorage can be missing (tests, SSR) or throw (private mo
+       4 function storage(): Storage | null {
+       5   try {
+       6     return typeof localStorage === 'undefined' ? null : localSto
+         rage;
+       8     return null;
+       9   }
+      10 }
+     … +29 lines (ctrl+o to expand)
+
+⏺ Write(src/api/errors.ts)
+  ⎿  Wrote 63 lines to src/api/errors.ts
+       1 export type ApiErrorKind =
+       2   | 'validation'
+       3   | 'unauthorized'
+       4   | 'not_found'
+       5   | 'idempotency_mismatch'
+       6   | 'rate_limited'
+       7   | 'server'
+       8   | 'timeout'
+       9   | 'network'
+      10   | 'bad_response';
+     … +61 lines (ctrl+o to expand)
+
+⏺ Write(src/api/client.ts)
+  ⎿  Wrote 123 lines to src/api/client.ts
+       1 import { API_BASE_URL, GET_RETRY_ATTEMPTS, REQUEST_TIMEOUT_MS }
+         from './config';
+       2 import { ApiError, ApiErrorKind, isRetryable } from './errors';
+       4
+       5 export type ApiResponse = { status: number; body: unknown; heade
+         rs: Headers };
+       6
+       8   method?: 'GET' | 'POST';
+       9   body?: unknown;
+      10   headers?: Record<string, string>;
+     … +134 lines (ctrl+o to expand)
+
+⏺ Write(src/api/parse.ts)
+  ⎿  Wrote 45 lines to src/api/parse.ts
+       1 import { Decimal, parseDecimal } from '@/money/decimal';
+       2
+       3 import { ApiError } from './errors';
+       5 /** Guards for response bodies: the server is remote and may sen
+         d unexpected data. */
+       6 export type Json = Record<string, unknown>;
+       7
+       9   return new ApiError('bad_response', `Unexpected response: ${wh
+         at}`);
+      10 }
+     … +40 lines (ctrl+o to expand)
+
+⏺ Write(src/types/api.ts)
+  ⎿  Wrote 46 lines to src/types/api.ts
+       1 import { Decimal } from '@/money/decimal';
+       2
+       3 export type Balance = {
+       4   asset: string;
+       5   decimals: number;
+       6   available: Decimal;
+       7   pending: Decimal;
+       8   claiming: Decimal;
+       9   usdPrice: Decimal;
+      10 };
+     … +36 lines (ctrl+o to expand)
+
+⏺ Write(src/api/balances.ts)
+  ⎿  Wrote 24 lines to src/api/balances.ts
+       1 import { Balance, BalancesSnapshot } from '@/types/api';
+       2
+       3 import { apiGet } from './client';
+       4 import { asArray, asObject, readDecimal, readInteger, readString
+          } from './parse';
+       6 function parseBalance(value: unknown): Balance {
+       7   const item = asObject(value, 'balance');
+       8   return {
+       9     asset: readString(item, 'asset'),
+      10     decimals: readInteger(item, 'decimals'),
+     … +15 lines (ctrl+o to expand)
+
+⏺ Write(src/api/claims.ts)
+  ⎿  Wrote 56 lines to src/api/claims.ts
+       1 import { toApiString } from '@/money/decimal';
+       2 import { Claim, ClaimOptions, ClaimStatus, CreateClaimRequest }
+       3
+       4 import { apiGet, apiRequest } from './client';
+       5 import { ApiError } from './errors';
+         dString } from './parse';
+       7
+       8 const STATUSES: readonly ClaimStatus[] = ['pending', 'completed'
+       9
+      10 function parseClaim(value: unknown): Claim {
+     … +59 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Typecheck is clean. Next: the theme, the token screen, the root layout and a
+  client test (error mapping, timeout, 429).
+
+⏺ Write(src/constants/theme.ts)
+  ⎿  Wrote 36 lines to src/constants/theme.ts
+       1 export const colors = {
+       2   background: '#F5F6F8',
+       3   surface: '#FFFFFF',
+       4   border: '#E1E4E8',
+       5   text: '#111418',
+       6   textMuted: '#5F6670',
+       7   primary: '#1F6FEB',
+       8   primaryText: '#FFFFFF',
+       9   disabled: '#A9B4C2',
+      10   danger: '#C62828',
+     … +26 lines (ctrl+o to expand)
+
+⏺ Write(src/components/Button.tsx)
+  ⎿  Wrote 52 lines to src/components/Button.tsx
+       1 import { ActivityIndicator, Pressable, StyleSheet, Text } from '
+         react-native';
+       2
+         heme';
+       4
+       5 type ButtonProps = {
+       6   title: string;
+       8   variant?: 'primary' | 'secondary';
+       9   disabled?: boolean;
+      10   loading?: boolean;
+     … +48 lines (ctrl+o to expand)
+
+⏺ Write(src/app/token.tsx)
+  ⎿  Wrote 68 lines to src/app/token.tsx
+       1 import { router } from 'expo-router';
+       2 import { useState } from 'react';
+       3 import { StyleSheet, Text, TextInput, View } from 'react-native'
+       4
+       5 import { getToken, setToken } from '@/api/tokenStorage';
+       6 import { Button } from '@/components/Button';
+       7 import { colors, fontSize, radius, spacing } from '@/constants/t
+       8
+       9 export default function TokenScreen() {
+      10   const [value, setValue] = useState('');
+     … +65 lines (ctrl+o to expand)
+⏺ Write(src/app/_layout.tsx)
+  ⎿  Added 9 lines, removed 2 lines
+       1 -import { Stack } from "expo-router";                           
+       1 +import { Stack } from 'expo-router';                           
+       2  
+       3 +import { colors } from '@/constants/theme';                    
+       4 +                                                               
+       5  export default function RootLayout() {
+       4 -  return <Stack />;                                            
+       6 +  return (                                                     
+       7 +    <Stack screenOptions={{ contentStyle: { backgroundColor: co
+         +lors.background } }}>                                          
+       8 +      <Stack.Screen name="index" options={{ title: 'Payback' }}
+         + />                                                            
+       9 +      <Stack.Screen name="token" options={{ title: 'API token' 
+         +}} />                                                          
+      10 +    </Stack>                                                   
+      11 +  );                                                           
+      12  }
+
+⏺ Write(src/api/client.test.ts)
+  ⎿  Wrote 102 lines to src/api/client.test.ts
+       1 import { apiGet, apiRequest } from './client';
+       2 import { ApiError, isOutcomeUnknown } from './errors';
+       3 import { getToken } from './tokenStorage';
+       5 jest.mock('./tokenStorage', () => ({ getToken: jest.fn() }));
+       6
+       7 const mockedGetToken = getToken as jest.MockedFunction<typeof ge
+         tToken>;
+       9
+      10 function jsonResponse(status: number, body: unknown, headers: Re
+         cord<string, string> = {}): Response {
+     … +108 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ One type error: global isn't typed, so I'm switching to globalThis. I'm also
+  making the index route redirect to the token screen when no token is saved.
+
+⏺ Update(src/api/client.test.ts)
+  ⎿  Added 1 line, removed 1 line
+      14  beforeEach(() => {
+      15    mockedGetToken.mockReturnValue('test-token');
+      16    fetchMock.mockReset();
+      17 -  global.fetch = fetchMock;                                    
+      17 +  globalThis.fetch = fetchMock;                                
+      18  });
+      19  
+      20  async function captureError(promise: Promise<unknown>): Promise
+          <ApiError> {
+
+⏺ Write(src/app/index.tsx)
+  ⎿  Added 14 lines, removed 8 lines
+       1 -import { Text, View, StyleSheet } from "react-native";         
+       1 +import { Link, Redirect } from 'expo-router';                  
+       2 +import { StyleSheet, Text, View } from 'react-native';         
+       3  
+       3 -export default function Index() {                              
+       4 +import { getToken } from '@/api/tokenStorage';                 
+       5 +import { colors, spacing } from '@/constants/theme';           
+       6 +                                                               
+       7 +export default function HomeScreen() {                         
+       8 +  if (!getToken()) return <Redirect href="/token" />;          
+       9 +                                                               
+      10    return (
+      11      <View style={styles.container}>
+       6 -      <Text>Edit src/app/index.tsx to edit this screen.</Text> 
+      12 +      <Text>Balances come next.</Text>                         
+      13 +      <Link href="/token" style={styles.link}>                 
+      14 +        Change token                                           
+      15 +      </Link>                                                  
+      16      </View>
+      17    );
+      18  }
+      19  
+      20  const styles = StyleSheet.create({
+      12 -  container: {                                                 
+      13 -    flex: 1,                                                   
+      14 -    alignItems: "center",                                      
+      15 -    justifyContent: "center",                                  
+      16 -  },                                                           
+      21 +  container: { flex: 1, padding: spacing.md, gap: spacing.md },
+      22 +  link: { color: colors.primary },                             
+      23  });
+
+⏺ Bash(npx tsc --noEmit; echo "tsc exit $?"; npx jest 2>&1 | tail -5; npx expo
+      lint 2>&1 | tail -15; git status --short; date -u +%H:%M)
+  ⎿  Created eslint.config.js (+10 -0)
+       1 +// https://docs.expo.dev/guides/using-eslint/                  
+       2 +const { defineConfig } = require('eslint/config');             
+       3 +const expoConfig = require('eslint-config-expo/flat');         
+       4 +                                                               
+       5 +module.exports = defineConfig([                                
+       6 +  expoConfig,                                                  
+       7 +  {                                                            
+       8 +    ignores: ['dist/*'],                                       
+       9 +  },                                                           
+      10 +]);                                                            
+  ⎿  Updated package.json (+4 -2)
+      31    },
+      32    "devDependencies": {
+      33      "@testing-library/react-native": "^14.1.0",
+      34 +    "@types/jest": "~30.0.0",                                  
+      35      "@types/react": "~19.3.0",
+      35 -    "typescript": "~6.0.3",                                    
+      36 -    "@types/jest": "~30.0.0"                                   
+      36 +    "eslint": "^9.0.0",                                        
+      37 +    "eslint-config-expo": "~58.0.4",                           
+      38 +    "typescript": "~6.0.3"                                     
+      39    },
+      40    "scripts": {
+      41      "start": "expo start",
+  ⎿  … 1 more file changed
+  ⎿  (timeout 3m)
+
+⏺ expo lint installed ESLint and its config on its own, then failed on a version
+  check. I'll run ESLint directly.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The API-layer phase is done and it's my turn to pause: please review the code
+  and check it in the browser. It's 13:06 UTC.
+
+  What's new:
+  - src/api/client.ts is the only place that calls fetch.
+    - It adds the bearer token and stops a request after 15s.
+    - Every failure becomes a typed ApiError, using the error code from the
+      response body or, failing that, the HTTP status. It also reads
+      retryAfterMs or the Retry-After header.
+    - apiGet retries temporary failures twice (backoff, or the server's wait
+      time on 429). POST requests are never retried here; the claim flow will
+      decide that with the same idempotency key.
+  - src/api/errors.ts: isOutcomeUnknown covers timeout, network and 5xx, and
+    errorMessage gives readable text for the UI.
+  - src/api/parse.ts and balances.ts (src/api/balances.ts) / claims.ts
+    (src/api/claims.ts) check the response shape and turn amounts into Decimal.
+    Unexpected data becomes a bad_response error instead of a crash.
+  - src/api/tokenStorage.ts stores the token in localStorage and treats missing
+    or blocked storage as "no token".
+  - src/app/token.tsx is the enter/change token screen; the input is masked.
+  - src/app/index.tsx is a placeholder that sends you to the token screen if
+    none is saved.
+  - Theme and Button component; 9 client tests.
+
+  Checks: 69/69 tests pass, tsc is clean, eslint src is clean.
+
+  Risks:
+  - bad_response on POST /claims is not treated as "outcome unknown" yet. A 201
+    with a body we can't read means the claim exists. I'll handle that in the
+    claim flow.
+  - npx expo lint installed eslint and eslint-config-expo itself and created
+    eslint.config.js. It then failed its own version check, so I ran npx eslint
+    src directly.
+
+  Browser check at ~390px: no restart needed.
+  - Reload: it should redirect to the token screen.
+  - Paste your token and press Save: you should see the placeholder.
+  - "Change token" should go back, now with Cancel.
+
+  Suggested commits:
+  git add eslint.config.js package.json package-lock.json
+  git commit -m "chore: add eslint config"
+
+  git add src/api src/types src/constants src/components src/app
+  git commit -m "feat: add api client, token storage and token screen"
+
+  Next is the Home screen: balances, USD total, "updated Xs ago",
+  loading/error/retry/refresh and auto-refresh every 15s. Then the deploy. Paste
+  the curl output if you ran it; I'd like to confirm the real asset names and
+  decimals.
+
+❯ before continue:
+  Add a vercel.json in the repo root so routes work on refresh. We use web
+  output "single", so every path should fall back to index.html:
+
+  {
+    "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+  }
+
+  Nothing else in it. Then suggest the commit (chore: add vercel spa rewrites)
+  and wait for my ok.
+
+⏺ Write(vercel.json)
+  ⎿  Wrote 3 lines to vercel.json
+      1 {
+      2   "rewrites": [{ "source": "/(.*)", "destination": "/index.html"
+        }]
+      3 }
+
+⏺ I added vercel.json with only that rewrite. Vercel serves real files before
+  applying rewrites, so the JS bundles and assets still load normally.
+
+  Two things to know before the deploy:
+  - Hosting: earlier we agreed on EAS Hosting. I'll take this as a switch to
+    Vercel and update NOTES.md to match.
+  - Build settings: since vercel.json has nothing else in it, set these in the
+    Vercel project settings: Build Command npx expo export -p web, Output
+    Directory dist. Otherwise, run npx expo export -p web locally and deploy the
+    dist folder with vercel deploy dist --prod.
+
+  git add vercel.json
+  git commit -m "chore: add vercel spa rewrites"
+
+  Waiting for your ok. If you haven't committed the API-layer changes yet, that
+  pair of commits is in my previous message.
+
+❯ ok
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All four commits are in — starting Home now: a useBalances hook (initial load,
+  manual refresh, silent 15s auto-refresh, no stale snapshot swaps), a USD
+  total card with "Updated Xs ago," per-asset rows, and
+  loading/error-with-retry/empty states plus a "Change token" link.
+
+⏺ Write(src/money/format.ts)
+  ⎿  Wrote 10 lines to src/money/format.ts
+       1 import { Decimal, toApiString } from './decimal';
+       2
+         thousands grouped ("1,234.5"). */
+       4 export function formatAmount(value: Decimal): string {
+       5   const plain = toApiString(value);
+       7   const [intPart, fracPart] = (negative ? plain.slice(1) : plain
+         ).split('.');
+       8   const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+         art}` : ''}`;
+      10 }
+     … +3 lines (ctrl+o to expand)
+
+⏺ Write(src/money/format.test.ts)
+  ⎿  Wrote 15 lines to src/money/format.test.ts
+       1 import { parseDecimal } from './decimal';
+       2 import { formatAmount } from './format';
+       3
+       4 describe('formatAmount', () => {
+       5   it.each([
+       6     ['820.413207', '820.413207'],
+       7     ['1234567.5', '1,234,567.5'],
+       8     ['1000', '1,000'],
+       9     ['0.000001', '0.000001'],
+      10     ['0', '0'],
+     … +5 lines (ctrl+o to expand)
+
+⏺ Write(src/utils/time.ts)
+  ⎿  Wrote 11 lines to src/utils/time.ts
+       1 /** "just now", "12 s ago", "3 min ago", "2 h ago". Clock skew (
+         future times) reads as "just now". */
+       2 export function formatAge(isoTime: string, nowMs: number): strin
+       3   const time = Date.parse(isoTime);
+       4   if (Number.isNaN(time)) return 'unknown';
+       5   const seconds = Math.floor((nowMs - time) / 1000);
+       6   if (seconds < 5) return 'just now';
+       8   const minutes = Math.floor(seconds / 60);
+       9   if (minutes < 60) return `${minutes} min ago`;
+      10   return `${Math.floor(minutes / 60)} h ago`;
+     … +2 lines (ctrl+o to expand)
+
+⏺ Write(src/utils/time.test.ts)
+  ⎿  Wrote 20 lines to src/utils/time.test.ts
+       1 import { formatAge } from './time';
+       2
+       3 const asOf = '2026-10-20T08:01:15.000Z';
+       4 const at = (offsetMs: number) => Date.parse(asOf) + offsetMs;
+       5
+       6 describe('formatAge', () => {
+       7   it.each([
+       8     [-10_000, 'just now'],
+       9     [2_000, 'just now'],
+      10     [12_000, '12 s ago'],
+     … +10 lines (ctrl+o to expand)
+
+⏺ Write(src/hooks/useNow.ts)
+  ⎿  Wrote 11 lines to src/hooks/useNow.ts
+       1 import { useEffect, useState } from 'react';
+       2
+       3 /** Current time, re-rendering every `intervalMs` (for "updated
+       4 export function useNow(intervalMs = 1000): number {
+       5   const [now, setNow] = useState(() => Date.now());
+       6   useEffect(() => {
+       7     const id = setInterval(() => setNow(Date.now()), intervalMs)
+       8     return () => clearInterval(id);
+       9   }, [intervalMs]);
+      10   return now;
+     … +2 lines (ctrl+o to expand)
+
+⏺ Write(src/hooks/useBalances.ts)
+  ⎿  Wrote 50 lines to src/hooks/useBalances.ts
+       1 import { useCallback, useEffect, useRef, useState } from 'react'
+         ;
+       2
+       3 import { fetchBalances } from '@/api/balances';
+       4 import { BalancesSnapshot } from '@/types/api';
+       6 /** The server recomputes balance snapshots every 15 s. */
+       7 const AUTO_REFRESH_MS = 15_000;
+       8
+       9 type BalancesState = {
+      10   snapshot: BalancesSnapshot | null;
+     … +48 lines (ctrl+o to expand)
+
+⏺ Write(src/components/ErrorBanner.tsx)
+  ⎿  Wrote 30 lines to src/components/ErrorBanner.tsx
+       1 import { StyleSheet, Text, View } from 'react-native';
+       2
+       3 import { colors, fontSize, radius, spacing } from '@/constants/t
+         heme';
+       4
+       6
+       7 type ErrorBannerProps = {
+       8   message: string;
+       9   actionTitle?: string;
+      10   onAction?: () => void;
+     … +23 lines (ctrl+o to expand)
+
+⏺ Write(src/components/BalanceRow.tsx)
+  ⎿  Wrote 46 lines to src/components/BalanceRow.tsx
+       1 import { StyleSheet, Text, View } from 'react-native';
+       2
+       3 import { colors, fontSize, radius, spacing } from '@/constants/t
+         heme';
+       4 import { isZero, mul } from '@/money/decimal';
+       6 import { formatUsd } from '@/money/usd';
+       7 import { Balance } from '@/types/api';
+       8
+       9 export function BalanceRow({ balance }: { balance: Balance }) {
+      10   return (
+     … +43 lines (ctrl+o to expand)
+⏺ Write(src/app/index.tsx)
+  ⎿  Added 61 lines, removed 10 lines
+       1  import { Link, Redirect } from 'expo-router';
+       2 -import { StyleSheet, Text, View } from 'react-native';         
+       2 +import { ActivityIndicator, FlatList, RefreshControl, StyleShee
+         +t, Text, View } from 'react-native';                           
+       3  
+       4 +import { ApiError, errorMessage } from '@/api/errors';         
+       5  import { getToken } from '@/api/tokenStorage';
+       5 -import { colors, spacing } from '@/constants/theme';           
+       6 +import { BalanceRow } from '@/components/BalanceRow';          
+       7 +import { Button } from '@/components/Button';                  
+       8 +import { ErrorBanner } from '@/components/ErrorBanner';        
+       9 +import { TotalCard } from '@/components/TotalCard';            
+      10 +import { colors, fontSize, spacing } from '@/constants/theme'; 
+      11 +import { useBalances } from '@/hooks/useBalances';             
+      12  
+      13 +function isUnauthorized(error: unknown): boolean {             
+      14 +  return error instanceof ApiError && error.kind === 'unauthori
+         +zed';                                                          
+      15 +}                                                              
+      16 +                                                               
+      17  export default function HomeScreen() {
+      18 +  const { snapshot, error, loading, refreshing, refresh, retry 
+         +} = useBalances();                                             
+      19 +                                                               
+      20    if (!getToken()) return <Redirect href="/token" />;
+      21  
+      22 +  if (loading) {                                               
+      23 +    return (                                                   
+      24 +      <View style={styles.center}>                             
+      25 +        <ActivityIndicator size="large" color={colors.primary} 
+         +/>                                                             
+      26 +        <Text style={styles.muted}>Loading balances…</Text>    
+      27 +      </View>                                                  
+      28 +    );                                                         
+      29 +  }                                                            
+      30 +                                                               
+      31 +  const errorBanner = error ? (                                
+      32 +    isUnauthorized(error) ? (                                  
+      33 +      <ErrorBanner message={errorMessage(error)} actionTitle="C
+         +hange token" onAction={() => {}} />                            
+      34 +    ) : (                                                      
+      35 +      <ErrorBanner                                             
+      36 +        message={snapshot ? `Couldn't refresh. ${errorMessage(e
+         +rror)}` : errorMessage(error)}                                 
+      37 +        onAction={snapshot ? refresh : retry}                  
+      38 +      />                                                       
+      39 +    )                                                          
+      40 +  ) : null;                                                    
+      41 +                                                               
+      42    return (
+      11 -    <View style={styles.container}>                            
+      12 -      <Text>Balances come next.</Text>                         
+      13 -      <Link href="/token" style={styles.link}>                 
+      14 -        Change token                                           
+      15 -      </Link>                                                  
+      16 -    </View>                                                    
+      43 +    <FlatList                                                  
+      44 +      style={styles.list}                                      
+      45 +      contentContainerStyle={styles.content}                   
+      46 +      data={snapshot?.items ?? []}                             
+      47 +      keyExtractor={(item) => item.asset}                      
+      48 +      renderItem={({ item }) => <BalanceRow balance={item} />} 
+      49 +      refreshControl={<RefreshControl refreshing={refreshing} o
+         +nRefresh={refresh} />}                                         
+      50 +      ListHeaderComponent={                                    
+      51 +        <View style={styles.header}>                           
+      52 +          {errorBanner}                                        
+      53 +          {snapshot && <TotalCard snapshot={snapshot} />}      
+      54 +          {snapshot && <Button title="Refresh" variant="seconda
+         +ry" onPress={refresh} loading={refreshing} />}                 
+      55 +        </View>                                                
+      56 +      }                                                        
+      57 +      ListEmptyComponent={snapshot ? <Text style={styles.muted}
+         +>No balances yet.</Text> : null}                               
+      58 +      ListFooterComponent={                                    
+      59 +        <Link href="/token" style={styles.link}>               
+      60 +          Change token                                         
+      61 +        </Link>                                                
+      62 +      }                                                        
+      63 +    />                                                         
+      64    );
+      65  }
+      66  
+      67  const styles = StyleSheet.create({
+      21 -  container: { flex: 1, padding: spacing.md, gap: spacing.md },
+      22 -  link: { color: colors.primary },                             
+      68 +  center: { flex: 1, alignItems: 'center', justifyContent: 'cen
+         +ter', gap: spacing.sm },                                       
+      69 +  list: { flex: 1 },                                           
+      70 +  content: { padding: spacing.md, gap: spacing.md },           
+      71 +  header: { gap: spacing.md },                                 
+      72 +  muted: { color: colors.textMuted, fontSize: fontSize.md, text
+         +Align: 'center' },                                             
+      73 +  link: { color: colors.primary, fontSize: fontSize.md, textAli
+         +gn: 'center', paddingVertical: spacing.md },                   
+      74  });
+  ⎿  PostToolUse:Write hook returned blocking error
+  ⎿  [node "$CLAUDE_PROJECT_DIR"/.claude/hooks/rn/post-tool-use.js]: [rn-hooks]
+     ESLint errors in src/app/index.tsx:
+     /Users/vladislav/Projects/test/payback-app/src/app/index.tsx
+       9:27  error  Unable to resolve path to module '@/components/TotalCard'
+     import/no-unresolved
+
+     ✖ 1 problem (1 error, 0 warnings)
+
+⏺ The hook flagged TotalCard, which I haven't written yet. I also left an empty
+  onAction on the 401 banner; it should open the token screen.
+
+⏺ Write(src/components/TotalCard.tsx)
+  ⎿  Wrote 36 lines to src/components/TotalCard.tsx
+       1 import { StyleSheet, Text, View } from 'react-native';
+       2
+       3 import { colors, fontSize, radius, spacing } from '@/constants/t
+       4 import { useNow } from '@/hooks/useNow';
+       5 import { formatUsd, usdTotal } from '@/money/usd';
+       6 import { BalancesSnapshot } from '@/types/api';
+       7 import { formatAge } from '@/utils/time';
+       9 export function TotalCard({ snapshot }: { snapshot: BalancesSnap
+         shot }) {
+      10   const now = useNow();
+     … +32 lines (ctrl+o to expand)
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line, removed 1 line
+      30  
+      31    const errorBanner = error ? (
+      32      isUnauthorized(error) ? (
+      33 -      <ErrorBanner message={errorMessage(error)} actionTitle="C
+         -hange token" onAction={() => {}} />                            
+      33 +      <ErrorBanner message={errorMessage(error)} actionTitle="C
+         +hange token" onAction={() => router.push('/token')} />         
+      34      ) : (
+      35        <ErrorBanner
+      36          message={snapshot ? `Couldn't refresh. ${errorMessage(e
+          rror)}` : errorMessage(error)}
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line, removed 1 line
+      1 -import { Link, Redirect } from 'expo-router';                   
+      1 +import { Link, Redirect, router } from 'expo-router';           
+      2  import { ActivityIndicator, FlatList, RefreshControl, StyleSheet
+         , Text, View } from 'react-native';
+      3  
+      4  import { ApiError, errorMessage } from '@/api/errors';
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line, removed 1 line
+      54            {snapshot && <Button title="Refresh" variant="seconda
+          ry" onPress={refresh} loading={refreshing} />}
+      55          </View>
+      56        }
+      57 -      ListEmptyComponent={snapshot ? <Text style={styles.muted}
+         ->No balances yet.</Text> : null}                               
+      57 +      ListEmptyComponent={snapshot ? <Text style={styles.muted}
+         +>No balances yet.</Text> : undefined}                          
+      58        ListFooterComponent={
+      59          <Link href="/token" style={styles.link}>
+      60            Change token
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Home is done and it's 13:10, so I'm pausing for your review and browser check.
+
+  What's new:
+  - src/hooks/useBalances.ts:
+    - Loads balances on open, refreshes when you ask, and refreshes quietly
+      every 15s (how often the server recomputes).
+    - Never runs two requests at once, and a slow, older snapshot can't replace
+      a newer one (compared by asOf).
+    - If a refresh fails, the last data stays on screen and an error banner
+      appears above it.
+  - src/components/TotalCard.tsx: the USD total of available balances (exact,
+    rounded once), with "Updated Xs ago" from asOf that ticks every second.
+  - src/components/BalanceRow.tsx: asset, its USD value, available, and
+    pending/claiming lines when they're not zero.
+  - src/app/index.tsx: loading spinner, error with Retry (or "Change token" on
+    a 401), empty state, a Refresh button and pull-to-refresh.
+  - formatAmount (thousands grouping, exact) and formatAge, with tests.
+
+  Checks: 80/80 tests pass; tsc and eslint are clean.
+
+  Risks:
+  - Clock skew: "Updated Xs ago" compares the server's asOf with the phone's
+    clock, so a skewed clock shifts it. A time in the future shows "just now".
+  - 401 polling: after a 401 the auto-refresh keeps trying every 15s. That's
+    harmless, but it's wasted requests.
+  - Pull-to-refresh on web: react-native-web doesn't do pull-to-refresh, so the
+    Refresh button is what works on the phone.
+
+  Browser check at ~390px: no restart needed. You should see the total,
+  "Updated…" counting up and resetting about every 15s, and per-asset cards.
+  Turning the network off in DevTools and pressing Refresh should keep the data
+  and show the error banner.
+
+  Correction on the deploy: don't use vercel deploy dist as I suggested earlier.
+  vercel.json sits in the repo root, not in dist, so the rewrites would be
+  lost. Deploy from the repo root instead: npx vercel --prod, with Build Command
+  npx expo export -p web and Output Directory dist. You'll have to log in to
+  Vercel yourself.
+
+  git add src
+  git commit -m "feat: add home screen with balances and usd total"
+
+  Next, once you confirm: the claim screen and its submit/status flow, with the
+  balance overlay. That's the biggest piece and has about 25 minutes before the
+  13:35 freeze. If it's running long, I'll keep the overlay and the "unknown
+  result" handling and drop polish.
+
+❯ <ide_opened_file>The user opened the file
+  /Users/vladislav/Projects/test/payback-app/src/utils/time.ts in the IDE. This
+  may or may not be related to the current task.</ide_opened_file>
+
+❯ commited, go ahead
+
+⏺ Starting the claim flow. Here's how it fits together:
+  - Claim store (module level): holds the claims you created this session and
+    polls a pending one until it settles, even if you leave the screen.
+  - Balance overlay: a pure function, unit-tested, applied inside useBalances
+    (decision 2).
+  - Submission hook: one idempotency key per request, automatic retries when the
+    outcome is unknown, then the "unknown" state with "Check again". The open
+    request is kept in module memory, so leaving and reopening the claim screen
+    still shows it.
+  - Claim screen: asset → amount/Max → destination → summary → confirm →
+    progress.
+
+⏺ Write(src/utils/idempotencyKey.ts)
+  ⎿  Wrote 12 lines to src/utils/idempotencyKey.ts
+       1 /**
+         nly exists in secure contexts
+       3  * (https/localhost), so a phone opening the dev server over LAN
+          http needs the getRandomValues fallback.
+       5 export function newIdempotencyKey(): string {
+       6   if (typeof crypto.randomUUID === 'function') return crypto.ran
+       7   const bytes = crypto.getRandomValues(new Uint8Array(16));
+       8   bytes[6] = (bytes[6] & 0x0f) | 0x40;
+       9   bytes[8] = (bytes[8] & 0x3f) | 0x80;
+         , '0')).join('');
+     … +7 lines (ctrl+o to expand)
+
+⏺ Write(src/utils/balanceOverlay.ts)
+  ⎿  Wrote 33 lines to src/utils/balanceOverlay.ts
+       1 import { add, compare, Decimal, sub, ZERO } from '@/money/decima
+       2 import { BalancesSnapshot, Claim } from '@/types/api';
+       3
+       5  * Applies claims created in this session that the snapshot does
+       6  * (snapshot `asOf` is before the claim's `createdAt`). Once a s
+         napshot with `asOf >= createdAt`
+          overlay stops, so nothing jumps back.
+       8  * Failed claims return their amount to `available`, so they are
+       9  */
+         ims: Claim[]): BalancesSnapshot {
+     … +33 lines (ctrl+o to expand)
+
+⏺ Write(src/utils/balanceOverlay.test.ts)
+  ⎿  Wrote 82 lines to src/utils/balanceOverlay.test.ts
+       1 import { parseDecimal, toApiString } from '@/money/decimal';
+       2 import { Balance, BalancesSnapshot, Claim, ClaimStatus } from '@
+         /types/api';
+       3
+       4 import { applyLocalClaims } from './balanceOverlay';
+       6 const d = (value: string) => {
+       7   const parsed = parseDecimal(value);
+       8   if (!parsed) throw new Error(`bad test value ${value}`);
+       9   return parsed;
+      10 };
+     … +90 lines (ctrl+o to expand)
+
+⏺ Write(src/hooks/localClaims.ts)
+  ⎿  Wrote 90 lines to src/hooks/localClaims.ts
+       1 import { useSyncExternalStore } from 'react';
+       2
+       3 import { delay } from '@/api/client';
+       5 import { toApiString } from '@/money/decimal';
+       6 import { Claim, CreateClaimRequest } from '@/types/api';
+       7
+       8 /**
+         ce overlay, status list) and the claim screen.
+      10  * Polling lives here, not in a component, so a claim keeps bein
+         g followed after the user navigates away.
+     … +90 lines (ctrl+o to expand)
+
+⏺ Write(src/hooks/useClaimSubmission.ts)
+  ⎿  Wrote 68 lines to src/hooks/useClaimSubmission.ts
+      1 import { useCallback, useState } from 'react';
+      2
+      3 import { createClaim } from '@/api/claims';
+      4 import { delay, retryDelayMs } from '@/api/client';
+      5 import { ApiError, errorMessage, isRetryable } from '@/api/errors
+      6 import { CreateClaimRequest } from '@/types/api';
+      7 import { newIdempotencyKey } from '@/utils/idempotencyKey';
+      8
+      9 import { getUnresolvedIntent, sameRequest, setUnresolvedIntent, t
+        rackClaim } from './localClaims';
+     … +69 lines (ctrl+o to expand)
+
+⏺ Write(src/hooks/useClaimOptions.ts)
+  ⎿  Wrote 26 lines to src/hooks/useClaimOptions.ts
+      1 import { useCallback, useEffect, useState } from 'react';
+      2
+      3 import { fetchClaimOptions } from '@/api/claims';
+      4 import { ClaimOptions } from '@/types/api';
+      5
+        nknown; loading: boolean };
+      7
+      8 export function useClaimOptions(asset: string) {
+      9   const [state, setState] = useState<ClaimOptionsState>({ options
+        : null, error: null, loading: true });
+     … +18 lines (ctrl+o to expand)
+  ⎿  PostToolUse:Write hook returned blocking error
+  ⎿  [node "$CLAUDE_PROJECT_DIR"/.claude/hooks/rn/post-tool-use.js]: [rn-hooks]
+     ESLint errors in src/hooks/useClaimOptions.ts:
+     /Users/vladislav/Projects/test/payback-app/src/hooks/useClaimOptions.ts
+       22:5  error  Error: Calling setState synchronously within an effect can
+     trigger cascading renders
+
+     Effects are intended to synchronize state between React and external
+     systems such as manually updating the DOM, state management libraries, or
+     other platform APIs. In general, the body of an effect should do one or
+     both of the following:
+     * Update external systems with the latest state from React.
+     * Subscribe for updates from some external system, calling setState in a
+     callback function when external state changes.
+
+     Calling setState synchronously within an effect body causes cascading
+     renders that can hurt performance, and is not recommended.
+     (https://react.dev/learn/you-might-not-need-an-effect).
+
+     /Users/vladislav/Projects/test/payback-app/src/hooks/useClaimOptions.ts:22:
+     5
+       20 |
+       21 |   useEffect(() => {
+     > 22 |     load();
+          |     ^^^^ Avoid calling setState() directly within an effect
+       23 |   }, [load]);
+       24 |
+       25 |   return { ...state, retry: load };  react-hooks/set-state-in-effect
+
+     ✖ 1 problem (1 error, 0 warnings)
+
+⏺ Update(src/hooks/useBalances.ts)
+  ⎿  Added 7 lines, removed 1 line
+      46    const refresh = useCallback(() => load('refresh'), [load]);
+      47    const retry = useCallback(() => load('initial'), [load]);
+      48  
+      49 -  return { ...state, refresh, retry };                         
+      49 +  const localClaims = useLocalClaims();                        
+      50 +  const snapshot = useMemo(                                    
+      51 +    () => (state.snapshot ? applyLocalClaims(state.snapshot, lo
+         +calClaims) : null),                                            
+      52 +    [state.snapshot, localClaims],                             
+      53 +  );                                                           
+      54 +                                                               
+      55 +  return { ...state, snapshot, refresh, retry };               
+      56  }
+
+⏺ Update(src/hooks/useBalances.ts)
+  ⎿  Added 4 lines, removed 1 line
+       1 -import { useCallback, useEffect, useRef, useState } from 'react
+         -';                                                             
+       1 +import { useCallback, useEffect, useMemo, useRef, useState } fr
+         +om 'react';                                                    
+       2  
+       3  import { fetchBalances } from '@/api/balances';
+       4  import { BalancesSnapshot } from '@/types/api';
+       5 +import { applyLocalClaims } from '@/utils/balanceOverlay';     
+       6  
+       7 +import { useLocalClaims } from './localClaims';                
+       8 +                                                               
+       9  /** The server recomputes balance snapshots every 15 s. */
+      10  const AUTO_REFRESH_MS = 15_000;
+      11  
+
+⏺ I'll update the hook so the effect only sets state once the request completes,
+  adding a cancel flag to prevent stale responses from being applied.
+
+⏺ Write(src/hooks/useClaimOptions.ts)
+  ⎿  Added 27 lines, removed 14 lines
+       5  
+       6  type ClaimOptionsState = { options: ClaimOptions | null; error:
+           unknown; loading: boolean };
+       7  
+       8 -export function useClaimOptions(asset: string) {               
+       9 -  const [state, setState] = useState<ClaimOptionsState>({ optio
+         -ns: null, error: null, loading: true });                       
+       8 +const LOADING: ClaimOptionsState = { options: null, error: null
+         +, loading: true };                                             
+       9  
+      11 -  const load = useCallback(async () => {                       
+      12 -    setState({ options: null, error: null, loading: true });   
+      13 -    try {                                                      
+      14 -      const options = await fetchClaimOptions(asset);          
+      15 -      setState({ options, error: null, loading: false });      
+      16 -    } catch (error) {                                          
+      17 -      setState({ options: null, error, loading: false });      
+      18 -    }                                                          
+      19 -  }, [asset]);                                                 
+      10 +async function load(asset: string): Promise<ClaimOptionsState> 
+         +{                                                              
+      11 +  try {                                                        
+      12 +    return { options: await fetchClaimOptions(asset), error: nu
+         +ll, loading: false };                                          
+      13 +  } catch (error) {                                            
+      14 +    return { options: null, error, loading: false };           
+      15 +  }                                                            
+      16 +}                                                              
+      17  
+      18 +/** Mount with `key={asset}` so a different asset starts from a
+         + fresh loading state. */                                       
+      19 +export function useClaimOptions(asset: string) {               
+      20 +  const [state, setState] = useState<ClaimOptionsState>(LOADING
+         +);                                                             
+      21 +  const [attempt, setAttempt] = useState(0);                   
+      22 +                                                               
+      23    useEffect(() => {
+      22 -    load();                                                    
+      23 -  }, [load]);                                                  
+      24 +    let cancelled = false;                                     
+      25 +    load(asset).then((next) => {                               
+      26 +      if (!cancelled) setState(next);                          
+      27 +    });                                                        
+      28 +    return () => {                                             
+      29 +      cancelled = true;                                        
+      30 +    };                                                         
+      31 +  }, [asset, attempt]);                                        
+      32  
+      25 -  return { ...state, retry: load };                            
+      33 +  const retry = useCallback(() => {                            
+      34 +    setState(LOADING);                                         
+      35 +    setAttempt((n) => n + 1);                                  
+      36 +  }, []);                                                      
+      37 +                                                               
+      38 +  return { ...state, retry };                                  
+      39  }
+
+⏺ Write(src/components/ChipSelect.tsx)  ⎿  Wrote 48 lines to src/components/ChipSelect.tsx
+       1 import { Pressable, StyleSheet, Text, View } from 'react-native'
+         ;
+       2
+         heme';
+       4
+       5 type ChipSelectProps = {
+       6   options: { id: string; label: string }[];
+       8   onSelect: (id: string) => void;
+       9   disabled?: boolean;
+      10 };
+     … +42 lines (ctrl+o to expand)
+
+⏺ Write(src/components/SummaryRows.tsx)
+  ⎿  Wrote 28 lines to src/components/SummaryRows.tsx
+       1 import { StyleSheet, Text, View } from 'react-native';
+       2
+       3 import { colors, fontSize, spacing } from '@/constants/theme';
+       4
+       5 type SummaryRowsProps = { rows: { label: string; value: string;
+       6
+       7 export function SummaryRows({ rows }: SummaryRowsProps) {
+       8   return (
+       9     <View style={styles.container}>
+      10       {rows.map((row) => (
+     … +22 lines (ctrl+o to expand)
+
+⏺ Write(src/components/ClaimProgress.tsx)
+  ⎿  Wrote 120 lines to src/components/ClaimProgress.tsx
+      1 import { router } from 'expo-router';
+      2 import { ActivityIndicator, StyleSheet, Text, View } from 'react-
+        native';
+      4 import { colors, fontSize, radius, spacing } from '@/constants/th
+        eme';
+      5 import { isPolling, trackClaim, useLocalClaims } from '@/hooks/lo
+        calClaims';
+      7 import { useNow } from '@/hooks/useNow';
+      8 import { formatAmount } from '@/money/format';
+      9 import { Claim } from '@/types/api';
+     … +133 lines (ctrl+o to expand)
+
+⏺ Update(src/hooks/localClaims.ts)
+  ⎿  Added 1 line
+      49      }
+      50    } finally {
+      51      polling.delete(id);
+      52 +    emit();                                                    
+      53    }
+      54  }
+      55  
+
+⏺ Write(src/components/ClaimForm.tsx)
+  ⎿  Wrote 125 lines to src/components/ClaimForm.tsx
+       1 import { useState } from 'react';
+       2 import { ActivityIndicator, StyleSheet, Text, TextInput, View }
+       3
+       4 import { errorMessage } from '@/api/errors';
+       5 import { colors, fontSize, radius, spacing } from '@/constants/t
+       6 import { useClaimOptions } from '@/hooks/useClaimOptions';
+       7 import { useClaimSubmission } from '@/hooks/useClaimSubmission';
+       8 import { checkClaimAmount, ClaimRules, maxClaimInput } from '@/m
+       9 import { formatAmount } from '@/money/format';
+      10 import { Balance } from '@/types/api';
+     … +138 lines (ctrl+o to expand)
+
+⏺ Write(src/app/claim.tsx)
+  ⎿  Wrote 49 lines to src/app/claim.tsx
+       1 import { Redirect, useLocalSearchParams } from 'expo-router';
+       2 import { useState } from 'react';
+       3 import { ActivityIndicator, ScrollView, StyleSheet, Text } from
+         'react-native';
+       4
+       6 import { getToken } from '@/api/tokenStorage';
+       7 import { ChipSelect } from '@/components/ChipSelect';
+       8 import { ClaimForm } from '@/components/ClaimForm';
+       9 import { ErrorBanner } from '@/components/ErrorBanner';
+      10 import { colors, fontSize, spacing } from '@/constants/theme';
+     … +46 lines (ctrl+o to expand)
+
+⏺ Now the Home side: a Claim button on each asset and a list of this session's
+  claims with their status. Plus the claim route title.
+
+⏺ Write(src/components/RecentClaims.tsx)
+  ⎿  Wrote 53 lines to src/components/RecentClaims.tsx
+       1 import { StyleSheet, Text, View } from 'react-native';
+       2
+       3 import { colors, fontSize, radius, spacing } from '@/constants/t
+         heme';
+       4 import { useLocalClaims } from '@/hooks/localClaims';
+       6 import { ClaimStatus } from '@/types/api';
+       7
+       8 const STATUS_TEXT: Record<ClaimStatus, string> = {
+       9   pending: 'Processing…',
+      10   completed: 'Completed',
+     … +50 lines (ctrl+o to expand)
+
+⏺ Update(src/components/BalanceRow.tsx)
+  ⎿  Added 6 lines
+      24        {!isZero(balance.claiming) && (
+      25          <Text style={styles.secondary}>{formatAmount(balance.cl
+          aiming)} being claimed</Text>
+      26        )}
+      27 +      <Button                                                  
+      28 +        title={`Claim ${balance.asset}`}                       
+      29 +        variant="secondary"                                    
+      30 +        disabled={isZero(balance.available)}                   
+      31 +        onPress={() => router.push({ pathname: '/claim', params
+         +: { asset: balance.asset } })}                                 
+      32 +      />                                                       
+      33      </View>
+      34    );
+      35  }
+  ⎿  PostToolUse:Edit hook returned blocking error
+  ⎿  [node "$CLAUDE_PROJECT_DIR"/.claude/hooks/rn/post-tool-use.js]: [rn-hooks]
+     ESLint errors in src/components/BalanceRow.tsx:
+     /Users/vladislav/Projects/test/payback-app/src/components/BalanceRow.tsx
+       27:8  error  'Button' is not defined  react/jsx-no-undef
+
+     ✖ 1 problem (1 error, 0 warnings)
+
+⏺ Update(src/components/BalanceRow.tsx)
+  ⎿  Added 1 line
+      1 +import { router } from 'expo-router';                           
+      2  import { StyleSheet, Text, View } from 'react-native';
+      3  
+      4  import { colors, fontSize, radius, spacing } from '@/constants/t
+         heme';
+  ⎿  PostToolUse:Edit hook returned blocking error
+  ⎿  [node "$CLAUDE_PROJECT_DIR"/.claude/hooks/rn/post-tool-use.js]: [rn-hooks]
+     ESLint errors in src/components/BalanceRow.tsx:
+     /Users/vladislav/Projects/test/payback-app/src/components/BalanceRow.tsx
+       28:8  error  'Button' is not defined  react/jsx-no-undef
+
+     ✖ 1 problem (1 error, 0 warnings)
+
+⏺ Update(src/components/BalanceRow.tsx)
+  ⎿  Added 2 lines
+       7  import { formatUsd } from '@/money/usd';
+       8  import { Balance } from '@/types/api';
+       9  
+      10 +import { Button } from './Button';                             
+      11 +                                                               
+      12  export function BalanceRow({ balance }: { balance: Balance }) {
+      13    return (
+      14      <View style={styles.card}>
+
+⏺ Update(src/components/BalanceRow.tsx)
+  ⎿  Added 1 line, removed 1 line
+      39  
+      40  const styles = StyleSheet.create({
+      41    card: {
+      42 -    gap: spacing.xs,                                           
+      42 +    gap: spacing.sm,                                           
+      43      padding: spacing.md,
+      44      borderRadius: radius.md,
+      45      backgroundColor: colors.surface,
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line
+      51          <View style={styles.header}>
+      52            {errorBanner}
+      53            {snapshot && <TotalCard snapshot={snapshot} />}
+      54 +          <RecentClaims />                                     
+      55            {snapshot && <Button title="Refresh" variant="seconda
+          ry" onPress={refresh} loading={refreshing} />}
+      56          </View>
+      57        }
+  ⎿  PostToolUse:Edit hook returned blocking error
+  ⎿  [node "$CLAUDE_PROJECT_DIR"/.claude/hooks/rn/post-tool-use.js]: [rn-hooks]
+     ESLint errors in src/app/index.tsx:
+     /Users/vladislav/Projects/test/payback-app/src/app/index.tsx
+       54:12  error  'RecentClaims' is not defined  react/jsx-no-undef
+
+     ✖ 1 problem (1 error, 0 warnings)
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line
+       6  import { BalanceRow } from '@/components/BalanceRow';
+       7  import { Button } from '@/components/Button';
+       8  import { ErrorBanner } from '@/components/ErrorBanner';
+       9 +import { RecentClaims } from '@/components/RecentClaims';      
+      10  import { TotalCard } from '@/components/TotalCard';
+      11  import { colors, fontSize, spacing } from '@/constants/theme';
+      12  import { useBalances } from '@/hooks/useBalances';
+
+⏺ Update(src/app/_layout.tsx)
+  ⎿  Added 1 line
+       6    return (
+       7      <Stack screenOptions={{ contentStyle: { backgroundColor: co
+          lors.background } }}>
+       8        <Stack.Screen name="index" options={{ title: 'Payback' }}
+           />
+       9 +      <Stack.Screen name="claim" options={{ title: 'Claim' }} /
+         +>                                                              
+      10        <Stack.Screen name="token" options={{ title: 'API token' 
+          }} />
+      11      </Stack>
+      12    );
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The claim flow is done and it's 13:16, so I'm pausing for your review and
+  browser check. 86/86 tests pass, and tsc and eslint are clean. The hook errors
+  above came from intermediate edits, before I added the imports.
+
+  What's new:
+  - Balance overlay in src/utils/balanceOverlay.ts (decision 2), with 6 tests.
+    - A pending claim is subtracted from available and added to claiming until a
+      snapshot arrives with asOf ≥ createdAt.
+    - A completed claim only reduces available; a failed one is never applied.
+    - Available never goes below zero.
+    - useBalances applies it, so Home and the claim screen show the same
+      numbers.
+  - Claim store in src/hooks/localClaims.ts: the claims made this session. It
+    polls GET /claims/{id} every 3s for up to 3 minutes, and keeps going when
+    you leave the screen.
+  - Submission in src/hooks/useClaimSubmission.ts (decision 3):
+    - One idempotency key per request.
+    - Timeout, network, 5xx, 429 or an unreadable 2xx: the same POST is repeated
+      with the same key, up to 3 times.
+    - After that it shows "We couldn't confirm your claim… Don't claim again",
+      with "Check again", which uses the same key.
+    - A 400 or other definite error unlocks the form.
+    - Pressing Confirm twice reuses the same key, so it can't create a
+      duplicate.
+  - UI:
+    - src/app/claim.tsx and ClaimForm (src/components/ClaimForm.tsx): asset,
+      amount and Max, destination, fee and "you receive", then a Review/Confirm
+      step showing the parsed amount.
+    - ClaimProgress (src/components/ClaimProgress.tsx): submitting, unknown,
+      pending ("No need to claim again"; "Taking longer than usual" after 30s),
+      completed, or failed with the reason.
+    - Home: a Claim button per asset and a "Your claims" list.
+
+  Risks:
+  - Reload loses the key: if you reload the page while a result is unknown, the
+    key is gone. It only lives in memory, not localStorage.
+  - Polling stops after 3 minutes: the claim then shows "Check status" so the
+    user can restart it.
+  - Max can be low: it uses the snapshot's available, which can be up to 15s
+    old. The server checks the live value, so this can't go wrong, only come out
+    lower.
+  - No tests yet for the submission hook: the retry and unknown logic is only
+    reviewed by hand.
+
+  Browser check at ~390px: no restart needed.
+  - Normal path: Claim on an asset → Max → Review → Confirm. Available should
+    drop straight away, "Your claims" should show "Processing…", then Completed
+    or Failed, with no jump back.
+  - Validation: try 0,5, 1e-3, too many decimals and below the minimum.
+  - Unknown result: set DevTools to Offline and press Confirm. It should show
+    "Checking…", then the unknown warning. Go back online and press "Check
+    again".
+
+  git add src/utils/balanceOverlay.ts src/utils/balanceOverlay.test.ts
+  src/utils/idempotencyKey.ts src/hooks
+  git commit -m "feat: add claim submission, tracking and balance overlay"
+
+  git add src/components src/app
+  git commit -m "feat: add claim screen with confirm and status view"
+
+  After that, if there's time before 13:35, I'd add tests for the submission
+  hook (retry with the same key, then unknown, then a replay). Then NOTES.md and
+  README.md. Has the Vercel deploy gone out?
+
+❯ <ide_opened_file>The user opened the file
+  /Users/vladislav/Projects/test/payback-app/src/app/index.tsx in the IDE. This
+  may or may not be related to the current task.</ide_opened_file>
+
+❯ Reload loses the key - could you add some protection here?
+
+⏺ Yes. I'll keep the unresolved request (asset, amount, destination, key) in
+  localStorage instead of only in memory:
+  - Reload: the request is restored, the claim screen opens in the locked
+    "couldn't confirm" state, and Home shows a "Check claim" banner.
+  - Cleared when the outcome becomes definite: a 201/200, or a 4xx.
+  - Also cleared when the token changes: "Check again" re-sends the POST, and
+    under a different token that would create a real claim on another account.
+  - Shared storage code: I'll move the localStorage wrapper into
+    src/utils/storage.ts so tokenStorage uses it too.
+
+⏺ Write(src/utils/storage.ts)
+  ⎿  Wrote 35 lines to src/utils/storage.ts
+       1 // localStorage can be missing (tests, SSR) or throw (private mo
+         de, blocked site data); every access is guarded.
+       2 function storage(): Storage | null {
+       4     return typeof localStorage === 'undefined' ? null : localSto
+         rage;
+       5   } catch {
+       6     return null;
+       8 }
+       9
+      10 export function readItem(key: string): string | null {
+     … +27 lines (ctrl+o to expand)
+
+⏺ Write(src/api/tokenStorage.ts)  ⎿  Added 5 lines, removed 27 lines
+       1 +import { readItem, removeItem, writeItem } from '@/utils/storag
+         +e';                                                            
+       2 +                                                               
+       3  const TOKEN_KEY = 'cashmine.token';
+       4  
+       3 -// localStorage can be missing (tests, SSR) or throw (private m
+         -ode); treat that as "no token".                                
+       4 -function storage(): Storage | null {                           
+       5 -  try {                                                        
+       6 -    return typeof localStorage === 'undefined' ? null : localSt
+         -orage;                                                         
+       7 -  } catch {                                                    
+       8 -    return null;                                               
+       9 -  }                                                            
+      10 -}                                                              
+      11 -                                                               
+       5  export function getToken(): string | null {
+      13 -  try {                                                        
+      14 -    return storage()?.getItem(TOKEN_KEY) || null;              
+      15 -  } catch {                                                    
+      16 -    return null;                                               
+      17 -  }                                                            
+       6 +  return readItem(TOKEN_KEY) || null;                          
+       7  }
+       8  
+       9  export function setToken(token: string): boolean {
+      21 -  try {                                                        
+      22 -    const store = storage();                                   
+      23 -    if (!store) return false;                                  
+      24 -    store.setItem(TOKEN_KEY, token);                           
+      25 -    return true;                                               
+      26 -  } catch {                                                    
+      27 -    return false;                                              
+      28 -  }                                                            
+      10 +  return writeItem(TOKEN_KEY, token);                          
+      11  }
+      12  
+      13  export function clearToken(): void {
+      32 -  try {                                                        
+      33 -    storage()?.removeItem(TOKEN_KEY);                          
+      34 -  } catch {                                                    
+      35 -    // Nothing to clear if storage is unavailable.             
+      36 -  }                                                            
+      14 +  removeItem(TOKEN_KEY);                                       
+      15  }
+
+⏺ Write(src/hooks/claimIntent.ts)
+  ⎿  Wrote 66 lines to src/hooks/claimIntent.ts
+       1 import { useSyncExternalStore } from 'react';
+       3 import { parseDecimal, toApiString } from '@/money/decimal';
+       4 import { CreateClaimRequest } from '@/types/api';
+       5 import { readItem, removeItem, writeItem } from '@/utils/storage
+       6
+       7 /**
+         potency-Key. Persisted in localStorage so
+       9  * neither leaving the screen nor reloading the page loses the k
+         ey: retrying with a new key could create
+          docs).
+     … +69 lines (ctrl+o to expand)
+
+⏺ Update(src/hooks/localClaims.ts)
+  ⎿  Removed 21 lines
+      68  export function isPolling(id: string): boolean {
+      69    return polling.has(id);
+      70  }
+      71 -                                                               
+      72 -/**                                                            
+      73 - * A POST /claims whose outcome we don't know yet, with its Ide
+         -mpotency-Key. Kept at module level so                          
+      74 - * leaving the claim screen doesn't lose the key (a new key cou
+         -ld create a duplicate claim).                                  
+      75 - * Lost on page reload — see NOTES.md.                         
+      76 - */                                                            
+      77 -export type ClaimIntent = { request: CreateClaimRequest; key: s
+         -tring };                                                       
+      78 -                                                               
+      79 -let unresolvedIntent: ClaimIntent | null = null;               
+      80 -                                                               
+      81 -export function getUnresolvedIntent(): ClaimIntent | null {    
+      82 -  return unresolvedIntent;                                     
+      83 -}                                                              
+      84 -                                                               
+      85 -export function setUnresolvedIntent(intent: ClaimIntent | null)
+         - {                                                             
+      86 -  unresolvedIntent = intent;                                   
+      87 -}                                                              
+      88 -                                                               
+      89 -export function sameRequest(a: CreateClaimRequest, b: CreateCla
+         -imRequest): boolean {                                          
+      90 -  return a.asset === b.asset && a.destinationId === b.destinati
+         -onId && toApiString(a.amount) === toApiString(b.amount);       
+      91 -}                                                              
+
+⏺ Update(src/hooks/localClaims.ts)
+  ⎿  Added 1 line, removed 2 lines
+      2  
+      3  import { delay } from '@/api/client';
+      4  import { fetchClaim } from '@/api/claims';
+      5 -import { toApiString } from '@/money/decimal';                  
+      6 -import { Claim, CreateClaimRequest } from '@/types/api';        
+      5 +import { Claim } from '@/types/api';                            
+      6  
+      7  /**
+      8   * Claims created in this browser session, shared by Home (balan
+         ce overlay, status list) and the claim screen.
+
+⏺ Update(src/hooks/useClaimSubmission.ts)
+  ⎿  Added 2 lines, removed 1 line
+       6  import { CreateClaimRequest } from '@/types/api';
+       7  import { newIdempotencyKey } from '@/utils/idempotencyKey';
+       8  
+       9 -import { getUnresolvedIntent, sameRequest, setUnresolvedIntent,
+         - trackClaim } from './localClaims';                            
+       9 +import { getUnresolvedIntent, sameRequest, setUnresolvedIntent 
+         +} from './claimIntent';                                        
+      10 +import { trackClaim } from './localClaims';                    
+      11  
+      12  /** Automatic repeats of the same POST (same key) before asking
+           the user. */
+      13  const SUBMIT_RETRIES = 3;
+
+⏺ Now the Home banner, clearing the request when the token changes, and a
+  persistence test.
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 1 line
+      17  
+      18  export default function HomeScreen() {
+      19    const { snapshot, error, loading, refreshing, refresh, retry 
+          } = useBalances();
+      20 +  const unresolvedIntent = useUnresolvedIntent();              
+      21  
+      22    if (!getToken()) return <Redirect href="/token" />;
+      23  
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 7 lines
+      52        ListHeaderComponent={
+      53          <View style={styles.header}>
+      54            {errorBanner}
+      55 +          {unresolvedIntent && (                               
+      56 +            <ErrorBanner                                       
+      57 +              message={`Your claim of ${formatAmount(unresolved
+         +Intent.request.amount)} ${unresolvedIntent.request.asset} is no
+         +t confirmed yet. Don't claim again — check it first.`}         
+      58 +              actionTitle="Check claim"                        
+      59 +              onAction={() => router.push({ pathname: '/claim',
+         + params: { asset: unresolvedIntent.request.asset } })}         
+      60 +            />                                                 
+      61 +          )}                                                   
+      62            {snapshot && <TotalCard snapshot={snapshot} />}
+      63            <RecentClaims />
+      64            {snapshot && <Button title="Refresh" variant="seconda
+          ry" onPress={refresh} loading={refreshing} />}
+
+⏺ Update(src/app/index.tsx)
+  ⎿  Added 2 lines
+       9  import { RecentClaims } from '@/components/RecentClaims';
+      10  import { TotalCard } from '@/components/TotalCard';
+      11  import { colors, fontSize, spacing } from '@/constants/theme';
+      12 +import { useUnresolvedIntent } from '@/hooks/claimIntent';     
+      13  import { useBalances } from '@/hooks/useBalances';
+      14 +import { formatAmount } from '@/money/format';                 
+      15  
+      16  function isUnauthorized(error: unknown): boolean {
+      17    return error instanceof ApiError && error.kind === 'unauthori
+          zed';
+
+⏺ Update(src/app/token.tsx)
+  ⎿  Added 2 lines
+      17        setError('Paste your API token');
+      18        return;
+      19      }
+      20 +    // An unconfirmed claim belongs to the old token; re-sendin
+         +g it with a new token would create a real claim there.         
+      21 +    if (token !== getToken()) setUnresolvedIntent(null);       
+      22      if (!setToken(token)) {
+      23        setError('Could not save the token: browser storage is un
+          available');
+      24        return;
+
+⏺ Update(src/app/token.tsx)
+  ⎿  Added 1 line
+       4  
+       5  import { getToken, setToken } from '@/api/tokenStorage';
+       6  import { Button } from '@/components/Button';
+       7 +import { setUnresolvedIntent } from '@/hooks/claimIntent';     
+       8  import { colors, fontSize, radius, spacing } from '@/constants/
+          theme';
+       9  
+      10  export default function TokenScreen() {
+
+⏺ Write(src/hooks/claimIntent.test.ts)
+  ⎿  Wrote 64 lines to src/hooks/claimIntent.test.ts
+       1 import { parseDecimal, toApiString } from '@/money/decimal';
+       2
+       3 const mockStore = new Map<string, string>();
+       4
+       5 jest.mock('@/utils/storage', () => ({
+       6   readItem: (key: string) => mockStore.get(key) ?? null,
+       7   writeItem: (key: string, value: string) => {
+       8     mockStore.set(key, value);
+       9     return true;
+      10   },
+     … +60 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The protection is in: an unconfirmed claim request now survives a reload.
+  90/90 tests pass, and tsc and eslint are clean. The IDE diagnostics above came
+  from intermediate edits, before I added the imports.
+
+  How it works:
+  - src/hooks/claimIntent.ts saves the request (asset, amount as an API string,
+    destination, key) to localStorage as soon as the POST starts.
+    - It's cleared only on a definite answer: 201/200, or a 4xx.
+    - On load it's checked like an API response; damaged data is dropped instead
+      of crashing.
+  - After a reload:
+    - The claim screen opens straight into "We couldn't confirm your claim" with
+      "Check again", which re-sends the same key and body.
+    - Home shows "Your claim of X is not confirmed yet. Don't claim again" with
+      a "Check claim" button.
+  - Changing the token clears the request. Re-sending it under a new token would
+    create a real claim on a different account.
+  - src/utils/storage.ts is the shared, guarded localStorage wrapper;
+    tokenStorage.ts (src/api/tokenStorage.ts) now uses it.
+  - 4 tests: survives a reload, cleared after the outcome, damaged storage
+    dropped, exact amount comparison.
+
+  Remaining risks:
+  - Key lifetime: the docs don't say how long the server remembers a key. If you
+    come back days later, "Check again" could create a new claim instead of
+    returning the old one. I'll put this in NOTES.md.
+  - Reload during a pending claim: if you reload after a 201 but before the
+    claim settles, the "Your claims" list and the overlay are gone. For up to
+    15s, available can look unchanged, until the next snapshot includes the
+    claim. Persisting the claim list too would fix that; it's about 10 more
+    minutes.
+
+  Browser check at ~390px:
+  - Go Offline, then Confirm a claim. Wait for "couldn't confirm", then reload
+    the page.
+  - Home should show the "not confirmed" banner, and the claim screen should be
+    locked.
+  - Go back online and press "Check again": you should get a single claim.
+
+  None of the claim work is committed yet. Suggested split, in this order:
+  git add src/utils/storage.ts src/api/tokenStorage.ts
+  git commit -m "refactor: share guarded localstorage helpers"
+
+  git add src/utils/balanceOverlay.ts src/utils/balanceOverlay.test.ts
+  src/utils/idempotencyKey.ts src/hooks
+  git commit -m "feat: add claim submission, tracking and balance overlay"
+
+  git add src/components src/app
+  git commit -m "feat: add claim screen with confirm and status view"
+
+  It's 13:20. The freeze is at 13:35, so after these commits I'd go straight to
+  NOTES.md and README.md. For the README I'll need the live link once the Vercel
+  deploy is up.
+
+❯ <ide_opened_file>The user opened the file
+  /Users/vladislav/Projects/test/payback-app/src/components/ChipSelect.tsx in
+  the IDE. This may or may not be related to the current
+  task.</ide_opened_file>
+
+❯ Key lifetime is 24 hours
+
+⏺ That changes "Check again": after about a day, re-sending the same key could
+  create a new claim instead of returning the old one. My plan:
+  - Store createdAt (the time of the first POST) with the request.
+  - Re-send only within a 23h window: one hour of margin under your 24h for
+    clock drift and slow requests.
+  - After that the app doesn't POST. It shows "We can't safely re-check this
+    claim", tells the user to check their balance and claim history first, and
+    offers a Dismiss button.
+  - A saved request without createdAt counts as expired, the cautious choice.
+
+  That 24h figure isn't in the API docs, so I'm recording it in NOTES.md as
+  coming from you.
+
+⏺ Update(src/hooks/claimIntent.ts)
+  ⎿  Added 12 lines, removed 1 line
+       9   * neither leaving the screen nor reloading the page loses the 
+          key: retrying with a new key could create
+      10   * a duplicate claim, retrying with the same key never does (AP
+          I docs).
+      11   */
+      12 -export type ClaimIntent = { request: CreateClaimRequest; key: s
+         -tring };                                                       
+      12 +export type ClaimIntent = { request: CreateClaimRequest; key: s
+         +tring; createdAt: number };                                    
+      13  
+      14  const INTENT_KEY = 'cashmine.unresolvedClaim';
+      15  
+      16 +/**                                                            
+      17 + * The server remembers an Idempotency-Key for 24 h (from the p
+         +roduct owner, not in the API docs).                            
+      18 + * After that the same key could create a new claim, so we stop
+         + re-sending an hour early                                      
+      19 + * to leave room for clock drift and slow requests.            
+      20 + */                                                            
+      21 +const SAFE_RETRY_WINDOW_MS = 23 * 60 * 60 * 1000;              
+      22 +                                                               
+      23 +export function isIntentExpired(intent: ClaimIntent, nowMs: num
+         +ber): boolean {                                                
+      24 +  return nowMs - intent.createdAt >= SAFE_RETRY_WINDOW_MS;     
+      25 +}                                                              
+      26 +                                                               
+      27  const listeners = new Set<() => void>();
+      28  
+      29  function subscribe(listener: () => void) {
+
+⏺ Update(src/hooks/claimIntent.ts)
+  ⎿  Added 4 lines, removed 2 lines
+      39    try {
+      40      const data: unknown = JSON.parse(raw);
+      41      if (typeof data !== 'object' || data === null) throw new Er
+          ror('not an object');
+      42 -    const { asset, amount, destinationId, key } = data as Recor
+         -d<string, unknown>;                                            
+      42 +    const { asset, amount, destinationId, key, createdAt } = da
+         +ta as Record<string, unknown>;                                 
+      43      const parsedAmount = typeof amount === 'string' ? parseDeci
+          mal(amount) : null;
+      44      if (typeof asset !== 'string' || typeof destinationId !== '
+          string' || typeof key !== 'string' || !parsedAmount) {
+      45        throw new Error('missing fields');
+      46      }
+      47 -    return { request: { asset, amount: parsedAmount, destinatio
+         -nId }, key };                                                  
+      47 +    // Without a valid creation time we can't prove the key is 
+         +still live, so treat it as expired.                            
+      48 +    const created = typeof createdAt === 'number' && Number.isF
+         +inite(createdAt) ? createdAt : 0;                              
+      49 +    return { request: { asset, amount: parsedAmount, destinatio
+         +nId }, key, createdAt: created };                              
+      50    } catch {
+      51      removeItem(INTENT_KEY);
+      52      return null;
+
+⏺ Update(src/hooks/claimIntent.ts)
+  ⎿  Added 4 lines, removed 1 line
+      63    current = intent;
+      64    if (intent) {
+      65      const { asset, amount, destinationId } = intent.request;
+      66 -    writeItem(INTENT_KEY, JSON.stringify({ asset, amount: toApi
+         -String(amount), destinationId, key: intent.key }));            
+      66 +    writeItem(                                                 
+      67 +      INTENT_KEY,                                              
+      68 +      JSON.stringify({ asset, amount: toApiString(amount), dest
+         +inationId, key: intent.key, createdAt: intent.createdAt }),    
+      69 +    );                                                         
+      70    } else {
+      71      removeItem(INTENT_KEY);
+      72    }
+
+⏺ Write(src/hooks/useClaimSubmission.ts)
+  ⎿  Added 31 lines, removed 7 lines
+       6  import { CreateClaimRequest } from '@/types/api';
+       7  import { newIdempotencyKey } from '@/utils/idempotencyKey';
+       8  
+       9 -import { getUnresolvedIntent, sameRequest, setUnresolvedIntent 
+         -} from './claimIntent';                                        
+       9 +import {                                                       
+      10 +  ClaimIntent,                                                 
+      11 +  getUnresolvedIntent,                                         
+      12 +  isIntentExpired,                                             
+      13 +  sameRequest,                                                 
+      14 +  setUnresolvedIntent,                                         
+      15 +} from './claimIntent';                                        
+      16  import { trackClaim } from './localClaims';
+      17  
+      18  /** Automatic repeats of the same POST (same key) before asking
+           the user. */
+     ...
+      22    | { phase: 'idle' }
+      23    | { phase: 'submitting'; checking: boolean }
+      24    | { phase: 'unknown'; request: CreateClaimRequest }
+      25 +  | { phase: 'expired'; intent: ClaimIntent }                  
+      26    | { phase: 'rejected'; message: string }
+      27    | { phase: 'submitted'; claimId: string };
+      28  
+     ...
+      34    return isRetryable(error) || (error instanceof ApiError && er
+          ror.kind === 'bad_response');
+      35  }
+      36  
+      37 +function initialState(): SubmissionState {                     
+      38 +  const intent = getUnresolvedIntent();                        
+      39 +  if (!intent) return { phase: 'idle' };                       
+      40 +  return isIntentExpired(intent, Date.now()) ? { phase: 'expire
+         +d', intent } : { phase: 'unknown', request: intent.request };  
+      41 +}                                                              
+      42 +                                                               
+      43  export function useClaimSubmission() {
+      31 -  const [state, setState] = useState<SubmissionState>(() => {  
+      32 -    const intent = getUnresolvedIntent();                      
+      33 -    return intent ? { phase: 'unknown', request: intent.request
+         - } : { phase: 'idle' };                                        
+      34 -  });                                                          
+      44 +  const [state, setState] = useState<SubmissionState>(initialSt
+         +ate);                                                          
+      45  
+      46    const submit = useCallback(async (request: CreateClaimRequest
+          ) => {
+      47      const existing = getUnresolvedIntent();
+      38 -    const intent = existing && sameRequest(existing.request, re
+         -quest) ? existing : { request, key: newIdempotencyKey() };     
+      48 +    if (existing && isIntentExpired(existing, Date.now())) {   
+      49 +      // Re-sending an expired key could create a second claim;
+         + the user has to check manually.                               
+      50 +      setState({ phase: 'expired', intent: existing });        
+      51 +      return;                                                  
+      52 +    }                                                          
+      53 +    const intent =                                             
+      54 +      existing && sameRequest(existing.request, request)       
+      55 +        ? existing                                             
+      56 +        : { request, key: newIdempotencyKey(), createdAt: Date.
+         +now() };                                                       
+      57      setUnresolvedIntent(intent);
+      58      setState({ phase: 'submitting', checking: intent === existi
+          ng });
+      59  
+     ...
+      83  
+      84    const reset = useCallback(() => setState({ phase: 'idle' }), 
+          []);
+      85  
+      68 -  return { state, submit, reset };                             
+      86 +  /** For an expired intent only: the user acknowledged they wi
+         +ll check the outcome themselves. */                            
+      87 +  const dismissExpired = useCallback(() => {                   
+      88 +    setUnresolvedIntent(null);                                 
+      89 +    setState({ phase: 'idle' });                               
+      90 +  }, []);                                                      
+      91 +                                                               
+      92 +  return { state, submit, reset, dismissExpired };             
+      93  }
+
+⏺ Now the UI for the expired state, the tests and NOTES.md.
+
+⏺ Update(src/components/ClaimForm.tsx)
+  ⎿  Added 1 line, removed 1 line
+      18  /** Mount with `key={balance.asset}`. */
+      19  export function ClaimForm({ balance }: { balance: Balance }) {
+      20    const { options, error, loading, retry } = useClaimOptions(ba
+          lance.asset);
+      21 -  const { state, submit, reset } = useClaimSubmission();       
+      21 +  const { state, submit, reset, dismissExpired } = useClaimSubm
+         +ission();                                                      
+      22    const [input, setInput] = useState('');
+      23    const [destinationId, setDestinationId] = useState<string | n
+          ull>(null);
+      24    const [confirming, setConfirming] = useState(false);
+
+⏺ Update(src/components/ClaimForm.tsx)  ⎿  Added 8 lines, removed 2 lines
+      23    const [destinationId, setDestinationId] = useState<string | n
+          ull>(null);
+      24    const [confirming, setConfirming] = useState(false);
+      25  
+      26 -  if (state.phase === 'submitting' || state.phase === 'unknown'
+         - || state.phase === 'submitted') {                             
+      27 -    return <ClaimProgress state={state} onCheckAgain={() => sta
+         -te.phase === 'unknown' && submit(state.request)} />;           
+      26 +  if (state.phase !== 'idle' && state.phase !== 'rejected') {  
+      27 +    return (                                                   
+      28 +      <ClaimProgress                                           
+      29 +        state={state}                                          
+      30 +        onCheckAgain={() => state.phase === 'unknown' && submit
+         +(state.request)}                                               
+      31 +        onDismissExpired={dismissExpired}                      
+      32 +      />                                                       
+      33 +    );                                                         
+      34    }
+      35    if (loading) return <ActivityIndicator color={colors.primary}
+           />;
+      36    if (!options) return <ErrorBanner message={errorMessage(error
+          )} onAction={retry} />;
+
+⏺ Update(src/components/ClaimProgress.tsx)
+  ⎿  Added 1 line
+      16  type ClaimProgressProps = {
+      17    state: Exclude<SubmissionState, { phase: 'idle' } | { phase: 
+          'rejected' }>;
+      18    onCheckAgain: () => void;
+      19 +  onDismissExpired: () => void;                                
+      20  };
+      21  
+      22  function Panel({ tone, title, body }: { tone: 'info' | 'success
+          ' | 'warning' | 'danger'; title: string; body?: string }) {
+
+⏺ Update(src/components/ClaimProgress.tsx)
+  ⎿  Added 1 line, removed 1 line
+      72    );
+      73  }
+      74  
+      75 -export function ClaimProgress({ state, onCheckAgain }: ClaimPro
+         -gressProps) {                                                  
+      75 +export function ClaimProgress({ state, onCheckAgain, onDismissE
+         +xpired }: ClaimProgressProps) {                                
+      76    const claims = useLocalClaims();
+      77    const claim = state.phase === 'submitted' ? claims.find((c) =
+          > c.id === state.claimId) : undefined;
+      78  
+
+⏺ Update(src/components/ClaimProgress.tsx)
+  ⎿  Added 10 lines
+       98            <Button title="Check again" onPress={onCheckAgain} /
+           >
+       99          </>
+      100        )}
+      101 +      {state.phase === 'expired' && (                         
+      102 +        <>                                                    
+      103 +          <Panel                                              
+      104 +            tone="danger"                                     
+      105 +            title="We can't safely re-check this claim"       
+      106 +            body={`Your claim of ${formatAmount(state.intent.r
+          +equest.amount)} ${state.intent.request.asset} from ${new Date(
+          +state.intent.createdAt).toLocaleString()} was never confirmed,
+          + and it's too late to check it from here. Before claiming agai
+          +n, look at your balance: if the amount left your available bal
+          +ance, the claim went through.`}                               
+      107 +          />                                                  
+      108 +          <Button title="I've checked, dismiss" variant="secon
+          +dary" onPress={onDismissExpired} />                           
+      109 +        </>                                                   
+      110 +      )}                                                      
+      111        {claim && (
+      112          <>
+      113            <SubmittedClaim claim={claim} />
+
+⏺ Update(src/hooks/claimIntent.test.ts)
+  ⎿  Added 6 lines, removed 2 lines
+      31  
+      32  beforeEach(() => mockStore.clear());
+      33  
+      34 +const HOUR = 60 * 60 * 1000;                                   
+      35 +const createdAt = Date.parse('2026-10-20T10:00:00Z');          
+      36 +                                                               
+      37  describe('unresolved claim intent', () => {
+      35 -  it('survives a reload with the same idempotency key and body'
+         -, () => {                                                      
+      36 -    reloadModule().setUnresolvedIntent({ request, key: 'key-123
+         -' });                                                          
+      38 +  it('survives a reload with the same idempotency key, body and
+         + creation time', () => {                                       
+      39 +    reloadModule().setUnresolvedIntent({ request, key: 'key-123
+         +', createdAt });                                               
+      40      const restored = reloadModule().getUnresolvedIntent();
+      41      expect(restored?.key).toBe('key-123');
+      42 +    expect(restored?.createdAt).toBe(createdAt);               
+      43      expect(restored?.request.asset).toBe('ETH');
+      44      expect(restored && toApiString(restored.request.amount)).to
+          Be('0.5');
+      45    });
+
+⏺ Update(src/hooks/claimIntent.test.ts)
+  ⎿  Added 20 lines, removed 1 line
+      46  
+      47    it('is removed once the outcome is known', () => {
+      48      const mod = reloadModule();
+      49 -    mod.setUnresolvedIntent({ request, key: 'key-123' });      
+      49 +    mod.setUnresolvedIntent({ request, key: 'key-123', createdA
+         +t });                                                          
+      50      mod.setUnresolvedIntent(null);
+      51      expect(reloadModule().getUnresolvedIntent()).toBeNull();
+      52    });
+      53  
+      54 +  it('stops being safe to re-send an hour before the 24 h key l
+         +ifetime', () => {                                              
+      55 +    const { isIntentExpired } = reloadModule();                
+      56 +    const intent = { request, key: 'key-123', createdAt };     
+      57 +    expect(isIntentExpired(intent, createdAt + 22 * HOUR)).toBe
+         +(false);                                                       
+      58 +    expect(isIntentExpired(intent, createdAt + 23 * HOUR)).toBe
+         +(true);                                                        
+      59 +    expect(isIntentExpired(intent, createdAt + 25 * HOUR)).toBe
+         +(true);                                                        
+      60 +  });                                                          
+      61 +                                                               
+      62 +  it('treats a stored intent without a creation time as expired
+         +', () => {                                                     
+      63 +    mockStore.set(                                             
+      64 +      'cashmine.unresolvedClaim',                              
+      65 +      JSON.stringify({ asset: 'ETH', amount: '0.5', destination
+         +Id: 'dest_wallet', key: 'old-key' }),                          
+      66 +    );                                                         
+      67 +    const mod = reloadModule();                                
+      68 +    const restored = mod.getUnresolvedIntent();                
+      69 +    expect(restored?.key).toBe('old-key');                     
+      70 +    expect(restored && mod.isIntentExpired(restored, Date.now()
+         +)).toBe(true);                                                 
+      71 +  });                                                          
+      72 +                                                               
+      73    it('drops corrupted storage instead of crashing', () => {
+      74      mockStore.set('cashmine.unresolvedClaim', '{"asset":"ETH","
+          amount":"1e-3","key":"k"}');
+      75      expect(reloadModule().getUnresolvedIntent()).toBeNull();
+
+⏺ Update(NOTES.md)
+  ⎿  Added 7 lines
+      27  (the API replays the original claim, never creates a duplicate)
+          , honours `retryAfterMs` on 429, and
+      28  if still unknown shows "Don't claim again, it may still go thro
+          ugh" with a "Check again" button.
+      29  With a claim id, it polls `GET /v1/claims/{id}` until completed
+          /failed.
+      30 +The unresolved request (body + key + time of first send) is kep
+         +t in localStorage, so a reload or leaving                      
+      31 +the screen doesn't lose the key; Home shows a "not confirmed ye
+         +t" banner. It is cleared on a definite                         
+      32 +answer (2xx with a claim, or 4xx) and when the token changes (r
+         +e-sending under another token would                            
+      33 +create a real claim there).                                    
+      34 +- Key lifetime: 24 h (given by the product owner, not in the AP
+         +I docs). The app re-sends only within                          
+      35 +  23 h of the first send (1 h margin for clock drift); after th
+         +at it doesn't POST and asks the user to                        
+      36 +  check their balance, because an expired key could create a se
+         +cond claim.                                                    
+      37  
+      38  ### Other assumptions
+      39  - USD total = value of `available` only; `pending` and `claimin
+          g` are shown per asset but not in the total.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ I added the 24-hour limit to "Check again". 92/92 tests pass, and tsc and
+  eslint are clean.
+
+  How it works:
+  - The saved request now keeps the time of its first POST.
+  - "Check again" re-sends the same key only within 23 hours of that time (an
+    hour of margin under your 24h).
+  - After that, or for an old saved request with no time:
+    - The app sends no POST and shows "We can't safely re-check this claim",
+      with the original amount and date.
+    - It tells the user to look at their balance before claiming again, and
+      offers "I've checked, dismiss".
+  - This is in useClaimSubmission.ts (src/hooks/useClaimSubmission.ts),
+    claimIntent.ts (src/hooks/claimIntent.ts) and ClaimProgress.tsx
+    (src/components/ClaimProgress.tsx).
+  - NOTES.md → Decisions now says the 24h figure came from you and isn't in the
+    API docs.
+  - 2 new tests: the 22h/23h boundary, and an old saved request with no time.
+
+  Risks:
+  - Device clock: the 23-hour check uses the phone's clock. Changing the clock
+    by more than an hour could defeat it.
+  - Dismiss is a judgement call: after dismissing, the user decides from their
+    balance. The app can't confirm the outcome, because the API has no way to
+    find a claim by idempotency key.
+
+  Browser check: the normal and Offline-then-reload checks from my previous
+  message still apply. To see the expired screen, in DevTools set createdAt in
+  localStorage['cashmine.unresolvedClaim'] to 0 and reload.
+
+  The claim flow is still uncommitted, and the last commit was 10 minutes ago.
+  Suggested split, in this order:
+  git add src/utils/storage.ts src/api/tokenStorage.ts
+  git commit -m "refactor: share guarded localstorage helpers"
+
+  git add src/utils/balanceOverlay.ts src/utils/balanceOverlay.test.ts
+  src/utils/idempotencyKey.ts src/hooks NOTES.md
+  git commit -m "feat: add claim submission, tracking and balance overlay"
+
+  git add src/components src/app
+  git commit -m "feat: add claim screen with confirm and status view"
+
+  It's 13:22, 13 minutes before the freeze. I'd use them to deploy the claim
+  flow and check it on the phone, not to add features. After that, NOTES.md and
+  README.md; I still need the live Vercel link for the README.
+
+❯ reviewed, checked - working, commited, go ahead
+
+⏺ Writing NOTES.md and README.md now. First, a quick check that
+  package-lock.json agrees with package.json, since a mismatch could break a
+  clean install on Vercel.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The lockfile matches package.json; the install expo lint ran re-synced it.
+  Writing the docs.
+
+⏺ Write(README.md)
+  ⎿  Added 41 lines, removed 38 lines
+       1 -# Welcome to your Expo app 👋                                  
+       1 +# Payback                                                      
+       2  
+       3 -This is an [Expo](https://expo.dev) project created with [`crea
+         -te-expo-app`](https://www.npmjs.com/package/create-expo-app).  
+       3 +A slice of a crypto cashback app: see payback balances and clai
+         +m them. Expo + TypeScript, shipped as a                        
+       4 +web build for phones (~390px wide).                            
+       5  
+       5 -## Get started                                                 
+       6 +**Live:** LIVE_URL                                             
+       7  
+       7 -1. Install dependencies                                        
+       8 +On first open the app asks for your API token. It is kept only 
+         +in this browser (localStorage) and can be                      
+       9 +changed from the link at the bottom of the home screen. The tok
+         +en is never in the code, the repo or the build.                
+      10  
+       9 -   ```bash                                                     
+      10 -   npm install                                                 
+      11 -   ```                                                         
+      11 +## What works                                                  
+      12  
+      13 -2. Start the app                                               
+      13 +- **Home:** balances per asset (available, pending, being claim
+         +ed), total available in USD, how fresh                         
+      14 +  the data is ("Updated 12 s ago"), loading, error with retry, 
+         +empty state, refresh button,                                   
+      15 +  auto-refresh every 15 s.                                     
+      16 +- **Claim:** pick an asset, type an amount or tap Max, pick a d
+         +estination, see the fee and what you'll                        
+      17 +  receive, review and confirm, then follow the claim until it i
+         +s completed or failed.                                         
+      18 +  - Input is validated against the API rules: format, the asset
+         +'s decimals, minimum, available, more than the fee.            
+      19 +  - After submitting, the balance drops right away and doesn't 
+         +jump back (see NOTES.md, decision 2).                          
+      20 +  - If the result is unknown (timeout, network error, 5xx), the
+         + same request is retried with the same                         
+      21 +    Idempotency-Key, so no duplicate claim is possible; the app
+         + says "don't claim again" and survives a reload.               
+      22 +- **Tests:** amount parsing, validation, fee, USD totals, round
+         +ing, the balance overlay, the API client's                     
+      23 +  error handling, and persisting an unconfirmed claim.         
+      24  
+      15 -   ```bash                                                     
+      16 -   npx expo start                                              
+      17 -   ```                                                         
+      25 +Not built: Activity (history with pagination). See NOTES.md for
+         + known issues.                                                 
+      26  
+      19 -In the output, you'll find options to open the app in a        
+      27 +## Run locally                                                 
+      28  
+      21 -- [development build](https://docs.expo.dev/develop/development
+         --builds/introduction/)                                         
+      22 -- [Android emulator](https://docs.expo.dev/workflow/android-stu
+         -dio-emulator/)                                                 
+      23 -- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/
+         -)                                                              
+      24 -- [Expo Go](https://expo.dev/go), a limited sandbox for trying 
+         -out app development with Expo                                  
+      29 +Requires Node 20+.                                             
+      30  
+      26 -You can start developing by editing the files inside the **src/
+         -app** directory. This project uses [file-based routing](https:/
+         -/docs.expo.dev/router/introduction).                           
+      31 +```bash                                                        
+      32 +npm install                                                    
+      33 +npx expo start --web    # open the printed URL, narrow the wind
+         +ow to ~390px or use device mode                                
+      34 +```                                                            
+      35  
+      28 -## Get a fresh project                                         
+      36 +```bash                                                        
+      37 +npm test                # jest (no network: fetch is mocked)   
+      38 +npx tsc --noEmit        # typecheck                            
+      39 +npx eslint src          # lint                                 
+      40 +```                                                            
+      41  
+      30 -When you're ready, run:                                        
+      42 +## Build and deploy                                            
+      43  
+      44  ```bash
+      33 -npm run reset-project                                          
+      45 +npx expo export -p web  # static single-page build in dist/    
+      46  ```
+      47  
+      36 -This command will move the starter code to the **example** dire
+         -ctory and create a blank **src/app** directory where you can st
+         -art developing.                                                
+      48 +Deployed on Vercel from the repo root: build command `npx expo 
+         +export -p web`, output directory `dist`.                       
+      49 +`vercel.json` rewrites every path to `index.html` so routes wor
+         +k on refresh.                                                  
+      50  
+      38 -### Other setup steps                                          
+      51 +## Structure                                                   
+      52  
+      40 -- To set up ESLint for linting, run `npx expo lint`, or follow 
+         -our guide on ["Using ESLint and Prettier"](https://docs.expo.de
+         -v/guides/using-eslint/)                                        
+      41 -- If you'd like to set up unit testing, follow our guide on ["U
+         -nit Testing with Jest"](https://docs.expo.dev/develop/unit-test
+         -ing/)                                                          
+      42 -- Learn more about the TypeScript setup in this template in our
+         - guide on ["Using TypeScript"](https://docs.expo.dev/guides/typ
+         -escript/)                                                      
+      53 +- `src/app/` routes (expo-router): `index` (home), `claim`, `to
+         +ken`                                                           
+      54 +- `src/api/` the only code that talks to the network; response 
+         +validation, typed errors, token storage                        
+      55 +- `src/money/` exact decimal math on BigInt, input parsing, cla
+         +im validation, USD totals, formatting                          
+      56 +- `src/hooks/` data loading, claim submission, claim tracking, 
+         +the unconfirmed-claim store                                    
+      57 +- `src/components/` UI pieces; `src/utils/` pure helpers; `src/
+         +types/` API types                                              
+      58  
+      44 -## Learn more                                                  
+      45 -                                                               
+      46 -To learn more about developing your project with Expo, look at 
+         -the following resources:                                       
+      47 -                                                               
+      48 -- [Expo documentation](https://docs.expo.dev/): Learn fundament
+         -als, or go into advanced topics with our [guides](https://docs.
+         -expo.dev/guides).                                              
+      49 -- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduc
+         -tion/): Follow a step-by-step tutorial where you'll create a pr
+         -oject that runs on Android, iOS, and the web.                  
+      50 -                                                               
+      51 -## Join the community                                          
+      52 -                                                               
+      53 -Join our community of developers creating universal apps.      
+      54 -                                                               
+      55 -- [Expo on GitHub](https://github.com/expo/expo): View our open
+         - source platform and contribute.                               
+      56 -- [Discord community](https://chat.expo.dev): Chat with Expo us
+         -ers and ask questions.                                         
+      59 +API docs: https://task-api.cashmine.io/docs                    
+
+⏺ Update(NOTES.md)
+  ⎿  Added 34 lines
+      43  
+      44  ## Working with AI
+      45  
+      46 +Logs: `ai-logs/` (AI_LOG_FILE).                                
+      47 +                                                               
+      48 +1. **The docs summary invented a section.** The first read of t
+         +he API docs went through a web-fetch                           
+      49 +   summariser, which added a "Notes and Gaps" section (e.g. "fe
+         +e rounding is not specified") that is not                      
+      50 +   in the docs. I caught it by re-reading the raw page with cur
+         +l, and planned only from that.                                 
+      51 +   Takeaway: for the source of truth, read the raw text, not a 
+         +summary.                                                       
+      52 +2. **Reload lost the Idempotency-Key.** The first version kept 
+         +the unconfirmed claim's key in memory and                      
+      53 +   listed "lost on reload" as a known risk. I asked for protect
+         +ion; the key, body and send time are now in                    
+      54 +   localStorage. I then told the AI the key lifetime (24 h, not
+         + in the docs); it added a 23 h re-send                         
+      55 +   window and a "can't safely re-check" state instead of re-sen
+         +ding an expired key.                                           
+      56 +3. **Wrong deploy command, self-corrected.** The AI first sugge
+         +sted `vercel deploy dist`, which would have                    
+      57 +   dropped `vercel.json` (it lives in the repo root, not in `di
+         +st/`), so routes would 404 on refresh.                         
+      58 +   It noticed and corrected it before the deploy: deploy from t
+         +he root with build/output settings.                            
+      59 +                                                               
+      60  ## Not done / known issues
+      61 +                                                               
+      62 +- **Activity screen** (history with pagination) was not built. 
+      63 +- **Claim list and balance overlay are in memory.** After a rel
+         +oad *after* a successful submit, "Your                         
+      64 +  claims" is empty and for up to 15 s (until the next snapshot)
+         + available may look unchanged. The                             
+      65 +  unconfirmed-request state (before we know the claim id) *is* 
+         +persisted.                                                     
+      66 +- **Expired unconfirmed claim:** after 23 h the app can't check
+         + the outcome itself (the API has no                            
+      67 +  lookup by Idempotency-Key); the user is asked to check their 
+         +balance. The 23 h check uses the                               
+      68 +  device clock.                                                
+      69 +- **Claim status polling** stops after 3 min; the user can rest
+         +art it with "Check status".                                    
+      70 +- **Max** uses the snapshot's `available` (up to 15 s old); the
+         + server checks the live value, so at worst                     
+      71 +  Max is lower than possible or the server rejects with a reada
+         +ble message.                                                   
+      72 +- **Comma input:** "1,000" is read as 1.000 (comma = decimal se
+         +parator). The confirm step shows the                           
+      73 +  parsed amount before anything is sent.                       
+      74 +- **Auto-refresh keeps running after a 401** (wasted requests; 
+         +the banner asks to change the token).                          
+      75 +- **Pull-to-refresh** does nothing on web; the Refresh button c
+         +overs it.                                                      
+      76 +- **"Updated X s ago"** compares server `asOf` with the device 
+         +clock.                                                         
+      77 +- **Tests:** no tests yet for the submission hook (retry → unkn
+         +own → replay) or for the screens; the                          
+      78 +  retry logic is reviewed by hand.                             
+      79 +- **USD total** is available only; pending and claiming are sho
+         +wn per asset but not totalled.                                 
+      80 +- `npx expo lint` fails its own ESLint version check in this se
+         +tup; `npx eslint src` works and is clean.                      
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ NOTES.md and README.md are written. It's 13:25, so this is the last chunk
+  before the freeze. These are written for the reviewers of the take-home.
+
+  README.md: the live link, what works (Activity listed as not built), how to
+  run, test, typecheck and lint locally, how to build and deploy on Vercel, and
+  the folder structure.
+
+  NOTES.md:
+  - Decisions: the three decisions plus assumptions, written earlier.
+  - Working with AI, three moments:
+    a. The docs summary made up a section, and I re-read the raw page.
+    b. A reload lost the idempotency key, and the 24h key lifetime you gave me.
+    c. The wrong vercel deploy dist command, which I corrected.
+  - Not done / known issues: 12 items, including that the claim list and overlay
+    aren't saved across a reload, Max uses the snapshot, the comma ambiguity,
+    and that the submission hook has no tests.
+  - It's about 970 words, a bit over a page; the Decisions section takes most of
+    that. Tell me if you want it shorter.
+
+  Two placeholders for you to fill in:
+  - LIVE_URL in README.md: your Vercel URL.
+  - AI_LOG_FILE in NOTES.md: the name of the log file you'll save in ai-logs/.
+
+  When you export this conversation into ai-logs/, remove private data. Your
+  token never appeared here, but check for your email and anything else
+  personal.
+
+  git add README.md NOTES.md
+  git commit -m "docs: add readme and notes"
+
+  After that, only redeploys of what's committed; no pushes or redeploys after
+  14:00 UTC. If you have a spare minute after the deploy, open the live URL on
+  the phone and do one claim to confirm the production build behaves like dev.

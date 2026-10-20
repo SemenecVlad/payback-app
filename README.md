@@ -1,56 +1,59 @@
-# Welcome to your Expo app 👋
+# Payback
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A slice of a crypto cashback app: see payback balances and claim them. Expo + TypeScript, shipped as a
+web build for phones (~390px wide).
 
-## Get started
+**Live:** [LIVE_URL](https://payback-app-pied.vercel.app/)
 
-1. Install dependencies
+On first open the app asks for your API token. It is kept only in this browser (localStorage) and can be
+changed from the link at the bottom of the home screen. The token is never in the code, the repo or the build.
 
-   ```bash
-   npm install
-   ```
+## What works
 
-2. Start the app
+- **Home:** balances per asset (available, pending, being claimed), total available in USD, how fresh
+  the data is ("Updated 12 s ago"), loading, error with retry, empty state, refresh button,
+  auto-refresh every 15 s.
+- **Claim:** pick an asset, type an amount or tap Max, pick a destination, see the fee and what you'll
+  receive, review and confirm, then follow the claim until it is completed or failed.
+  - Input is validated against the API rules: format, the asset's decimals, minimum, available, more than the fee.
+  - After submitting, the balance drops right away and doesn't jump back (see NOTES.md, decision 2).
+  - If the result is unknown (timeout, network error, 5xx), the same request is retried with the same
+    Idempotency-Key, so no duplicate claim is possible; the app says "don't claim again" and survives a reload.
+- **Tests:** amount parsing, validation, fee, USD totals, rounding, the balance overlay, the API client's
+  error handling, and persisting an unconfirmed claim.
 
-   ```bash
-   npx expo start
-   ```
+Not built: Activity (history with pagination). See NOTES.md for known issues.
 
-In the output, you'll find options to open the app in a
+## Run locally
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+Requires Node 20+.
 
 ```bash
-npm run reset-project
+npm install
+npx expo start --web    # open the printed URL, narrow the window to ~390px or use device mode
 ```
 
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
+```bash
+npm test                # jest (no network: fetch is mocked)
+npx tsc --noEmit        # typecheck
+npx eslint src          # lint
+```
 
-### Other setup steps
+## Build and deploy
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```bash
+npx expo export -p web  # static single-page build in dist/
+```
 
-## Learn more
+Deployed on Vercel from the repo root: build command `npx expo export -p web`, output directory `dist`.
+`vercel.json` rewrites every path to `index.html` so routes work on refresh.
 
-To learn more about developing your project with Expo, look at the following resources:
+## Structure
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+- `src/app/` routes (expo-router): `index` (home), `claim`, `token`
+- `src/api/` the only code that talks to the network; response validation, typed errors, token storage
+- `src/money/` exact decimal math on BigInt, input parsing, claim validation, USD totals, formatting
+- `src/hooks/` data loading, claim submission, claim tracking, the unconfirmed-claim store
+- `src/components/` UI pieces; `src/utils/` pure helpers; `src/types/` API types
 
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+API docs: https://task-api.cashmine.io/docs

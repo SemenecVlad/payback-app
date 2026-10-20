@@ -43,4 +43,38 @@ create a real claim there).
 
 ## Working with AI
 
+Logs: `ai-logs/` (ai-conversation-log.txt).
+
+1. **The docs summary invented a section.** The first read of the API docs went through a web-fetch
+   summariser, which added a "Notes and Gaps" section (e.g. "fee rounding is not specified") that is not
+   in the docs. I caught it by re-reading the raw page with curl, and planned only from that.
+   Takeaway: for the source of truth, read the raw text, not a summary.
+2. **Reload lost the Idempotency-Key.** The first version kept the unconfirmed claim's key in memory and
+   listed "lost on reload" as a known risk. I asked for protection; the key, body and send time are now in
+   localStorage. I then told the AI the key lifetime (24 h, not in the docs); it added a 23 h re-send
+   window and a "can't safely re-check" state instead of re-sending an expired key.
+3. **Wrong deploy command, self-corrected.** The AI first suggested `vercel deploy dist`, which would have
+   dropped `vercel.json` (it lives in the repo root, not in `dist/`), so routes would 404 on refresh.
+   It noticed and corrected it before the deploy: deploy from the root with build/output settings.
+
 ## Not done / known issues
+
+- **Activity screen** (history with pagination) was not built.
+- **Claim list and balance overlay are in memory.** After a reload *after* a successful submit, "Your
+  claims" is empty and for up to 15 s (until the next snapshot) available may look unchanged. The
+  unconfirmed-request state (before we know the claim id) *is* persisted.
+- **Expired unconfirmed claim:** after 23 h the app can't check the outcome itself (the API has no
+  lookup by Idempotency-Key); the user is asked to check their balance. The 23 h check uses the
+  device clock.
+- **Claim status polling** stops after 3 min; the user can restart it with "Check status".
+- **Max** uses the snapshot's `available` (up to 15 s old); the server checks the live value, so at worst
+  Max is lower than possible or the server rejects with a readable message.
+- **Comma input:** "1,000" is read as 1.000 (comma = decimal separator). The confirm step shows the
+  parsed amount before anything is sent.
+- **Auto-refresh keeps running after a 401** (wasted requests; the banner asks to change the token).
+- **Pull-to-refresh** does nothing on web; the Refresh button covers it.
+- **"Updated X s ago"** compares server `asOf` with the device clock.
+- **Tests:** no tests yet for the submission hook (retry → unknown → replay) or for the screens; the
+  retry logic is reviewed by hand.
+- **USD total** is available only; pending and claiming are shown per asset but not totalled.
+- `npx expo lint` fails its own ESLint version check in this setup; `npx eslint src` works and is clean.
