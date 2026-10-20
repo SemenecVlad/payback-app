@@ -1,0 +1,28 @@
+{
+  "guardNativeDirs": true,
+  "guardExpoInstall": true,
+  "guardSecrets": true,
+  "guardLockfiles": true,
+  "guardCloudCommands": true,
+  "guardGitPush": true,
+
+  "postFormat": true,
+  "postLint": true,
+  "postTypecheck": false,
+  "postExpoInstallCheck": true,
+  "postAppConfigCheck": true,
+
+  "stopTypecheck": true,
+  "stopRelatedTests": true,
+  "stopJunkScan": true,
+  "stopMaxBlocks": 2,
+
+  "subagentTestRunnerCheck": true,
+
+  "sessionStackContext": true,
+  "sessionEnvCheck": true,
+  "sessionTypecheckBaseline": true,
+
+  "notify": true,
+  "notifySound": true
+}

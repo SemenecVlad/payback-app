@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "expo@claude-plugins-official": true
+  },
+  "permissions": { "deny": ["Bash(git commit:*)", "Bash(git push:*)"] }
+}
