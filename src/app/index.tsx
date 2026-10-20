@@ -6,9 +6,12 @@ import { getToken } from '@/api/tokenStorage';
 import { BalanceRow } from '@/components/BalanceRow';
 import { Button } from '@/components/Button';
 import { ErrorBanner } from '@/components/ErrorBanner';
+import { RecentClaims } from '@/components/RecentClaims';
 import { TotalCard } from '@/components/TotalCard';
 import { colors, fontSize, spacing } from '@/constants/theme';
+import { useUnresolvedIntent } from '@/hooks/claimIntent';
 import { useBalances } from '@/hooks/useBalances';
+import { formatAmount } from '@/money/format';
 
 function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.kind === 'unauthorized';
@@ -16,6 +19,7 @@ function isUnauthorized(error: unknown): boolean {
 
 export default function HomeScreen() {
   const { snapshot, error, loading, refreshing, refresh, retry } = useBalances();
+  const unresolvedIntent = useUnresolvedIntent();
 
   if (!getToken()) return <Redirect href="/token" />;
 
@@ -50,7 +54,15 @@ export default function HomeScreen() {
       ListHeaderComponent={
         <View style={styles.header}>
           {errorBanner}
+          {unresolvedIntent && (
+            <ErrorBanner
+              message={`Your claim of ${formatAmount(unresolvedIntent.request.amount)} ${unresolvedIntent.request.asset} is not confirmed yet. Don't claim again — check it first.`}
+              actionTitle="Check claim"
+              onAction={() => router.push({ pathname: '/claim', params: { asset: unresolvedIntent.request.asset } })}
+            />
+          )}
           {snapshot && <TotalCard snapshot={snapshot} />}
+          <RecentClaims />
           {snapshot && <Button title="Refresh" variant="secondary" onPress={refresh} loading={refreshing} />}
         </View>
       }

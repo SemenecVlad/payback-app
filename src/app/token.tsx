@@ -4,6 +4,7 @@ import { StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { getToken, setToken } from '@/api/tokenStorage';
 import { Button } from '@/components/Button';
+import { setUnresolvedIntent } from '@/hooks/claimIntent';
 import { colors, fontSize, radius, spacing } from '@/constants/theme';
 
 export default function TokenScreen() {
@@ -17,6 +18,8 @@ export default function TokenScreen() {
       setError('Paste your API token');
       return;
     }
+    // An unconfirmed claim belongs to the old token; re-sending it with a new token would create a real claim there.
+    if (token !== getToken()) setUnresolvedIntent(null);
     if (!setToken(token)) {
       setError('Could not save the token: browser storage is unavailable');
       return;
