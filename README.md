@@ -19,10 +19,12 @@ changed from the link at the bottom of the home screen. The token is never in th
   - After submitting, the balance drops right away and doesn't jump back (see NOTES.md, decision 2).
   - If the result is unknown (timeout, network error, 5xx), the same request is retried with the same
     Idempotency-Key, so no duplicate claim is possible; the app says "don't claim again" and survives a reload.
+- **Activity:** history of paybacks, reversals and claims, newest first, 20 per page with "Load more"
+  (and on scroll), signed amounts, status, loading, error with retry, empty state and refresh.
 - **Tests:** amount parsing, validation, fee, USD totals, rounding, the balance overlay, the API client's
-  error handling, and persisting an unconfirmed claim.
+  error handling, activity parsing, and persisting an unconfirmed claim.
 
-Not built: Activity (history with pagination). See NOTES.md for known issues.
+See NOTES.md for known issues.
 
 ## Run locally
 
@@ -50,7 +52,7 @@ Deployed on Vercel from the repo root: build command `npx expo export -p web`, o
 
 ## Structure
 
-- `src/app/` routes (expo-router): `index` (home), `claim`, `token`
+- `src/app/` routes (expo-router): `index` (home), `claim`, `activity`, `token`
 - `src/api/` the only code that talks to the network; response validation, typed errors, token storage
 - `src/money/` exact decimal math on BigInt, input parsing, claim validation, USD totals, formatting
 - `src/hooks/` data loading, claim submission, claim tracking, the unconfirmed-claim store

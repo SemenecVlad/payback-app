@@ -39,6 +39,25 @@ export type Claim = {
   updatedAt: string;
 };
 
+export type ActivityType = 'accrual' | 'reversal' | 'claim';
+
+/** accrual: pending | confirmed; reversal: confirmed; claim: pending | completed | failed. */
+export type ActivityStatus = 'pending' | 'confirmed' | 'completed' | 'failed';
+
+export type ActivityItem = {
+  id: string;
+  type: ActivityType;
+  asset: string;
+  /** Signed: negative for reversals and claims. */
+  amount: Decimal;
+  status: ActivityStatus;
+  exchange: string | null;
+  createdAt: string;
+  relatedId: string | null;
+};
+
+export type ActivityPage = { items: ActivityItem[]; nextCursor: string | null };
+
 export type CreateClaimRequest = {
   asset: string;
   amount: Decimal;

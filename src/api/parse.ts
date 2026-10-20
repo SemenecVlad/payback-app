@@ -1,4 +1,4 @@
-import { Decimal, parseDecimal } from '@/money/decimal';
+import { Decimal, parseDecimal, parseSignedDecimal } from '@/money/decimal';
 
 import { ApiError } from './errors';
 
@@ -42,4 +42,16 @@ export function readDecimal(obj: Json, key: string): Decimal {
   const value = parseDecimal(readString(obj, key));
   if (!value) throw bad(key);
   return value;
+}
+
+export function readSignedDecimal(obj: Json, key: string): Decimal {
+  const value = parseSignedDecimal(readString(obj, key));
+  if (!value) throw bad(key);
+  return value;
+}
+
+export function readOneOf<T extends string>(obj: Json, key: string, allowed: readonly T[]): T {
+  const value = readString(obj, key);
+  if (!(allowed as readonly string[]).includes(value)) throw bad(`${key} "${value}"`);
+  return value as T;
 }

@@ -64,6 +64,7 @@ export default function HomeScreen() {
           {snapshot && <TotalCard snapshot={snapshot} />}
           <RecentClaims />
           {snapshot && <Button title="Refresh" variant="secondary" onPress={refresh} loading={refreshing} />}
+          <Button title="Activity" variant="secondary" onPress={() => router.push('/activity')} />
         </View>
       }
       ListEmptyComponent={snapshot ? <Text style={styles.muted}>No balances yet.</Text> : undefined}

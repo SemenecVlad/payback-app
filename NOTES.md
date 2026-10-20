@@ -59,7 +59,9 @@ Logs: `ai-logs/` (ai-conversation-log.txt).
 
 ## Not done / known issues
 
-- **Activity screen** (history with pagination) was not built.
+- **Activity** was added last. The API parsing and the pagination hook are tested (append without
+  duplicates, a next page arriving after a refresh is dropped, error paths); the screens themselves have
+  no render tests.
 - **Claim list and balance overlay are in memory.** After a reload *after* a successful submit, "Your
   claims" is empty and for up to 15 s (until the next snapshot) available may look unchanged. The
   unconfirmed-request state (before we know the claim id) *is* persisted.

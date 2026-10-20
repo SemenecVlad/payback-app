@@ -1,4 +1,4 @@
-import { add, compare, mul, parseDecimal, roundHalfUp, sub, toApiString, toFixed } from './decimal';
+import { add, compare, mul, parseDecimal, parseSignedDecimal, roundHalfUp, sub, toApiString, toFixed } from './decimal';
 
 const d = (value: string) => {
   const parsed = parseDecimal(value);
@@ -13,6 +13,17 @@ describe('parseDecimal', () => {
 
   it.each(['.5', '1.', '05', '1e-3', '-1', '', ' 1', '1,5', '1.2.3', 'NaN'])('rejects %p', (value) => {
     expect(parseDecimal(value)).toBeNull();
+  });
+});
+
+describe('parseSignedDecimal', () => {
+  it.each(['-9.81', '9.81', '-0.000001', '0'])('round-trips %s', (value) => {
+    const parsed = parseSignedDecimal(value);
+    expect(parsed && toApiString(parsed)).toBe(value);
+  });
+
+  it.each(['--1', '-', '-.5', '+1', '-05'])('rejects %p', (value) => {
+    expect(parseSignedDecimal(value)).toBeNull();
   });
 });
 

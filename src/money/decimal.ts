@@ -15,6 +15,13 @@ export function parseDecimal(value: string): Decimal | null {
   return { units: BigInt(intPart + fracPart), scale: fracPart.length };
 }
 
+/** Like parseDecimal, with an optional leading minus (activity amounts are signed). */
+export function parseSignedDecimal(value: string): Decimal | null {
+  if (!value.startsWith('-')) return parseDecimal(value);
+  const abs = parseDecimal(value.slice(1));
+  return abs ? { units: -abs.units, scale: abs.scale } : null;
+}
+
 function pow10(exp: number): bigint {
   return 10n ** BigInt(exp);
 }
