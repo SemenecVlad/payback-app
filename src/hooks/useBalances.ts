@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { fetchBalances } from '@/api/balances';
 import { BalancesSnapshot } from '@/types/api';
+import { applyLocalClaims } from '@/utils/balanceOverlay';
+
+import { useLocalClaims } from './localClaims';
 
 /** The server recomputes balance snapshots every 15 s. */
 const AUTO_REFRESH_MS = 15_000;
@@ -46,5 +49,11 @@ export function useBalances() {
   const refresh = useCallback(() => load('refresh'), [load]);
   const retry = useCallback(() => load('initial'), [load]);
 
-  return { ...state, refresh, retry };
+  const localClaims = useLocalClaims();
+  const snapshot = useMemo(
+    () => (state.snapshot ? applyLocalClaims(state.snapshot, localClaims) : null),
+    [state.snapshot, localClaims],
+  );
+
+  return { ...state, snapshot, refresh, retry };
 }

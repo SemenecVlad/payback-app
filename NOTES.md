@@ -27,6 +27,13 @@ outcome is unknown. The app shows "Checking your claim…", retries the same POS
 (the API replays the original claim, never creates a duplicate), honours `retryAfterMs` on 429, and
 if still unknown shows "Don't claim again, it may still go through" with a "Check again" button.
 With a claim id, it polls `GET /v1/claims/{id}` until completed/failed.
+The unresolved request (body + key + time of first send) is kept in localStorage, so a reload or leaving
+the screen doesn't lose the key; Home shows a "not confirmed yet" banner. It is cleared on a definite
+answer (2xx with a claim, or 4xx) and when the token changes (re-sending under another token would
+create a real claim there).
+- Key lifetime: 24 h (given by the product owner, not in the API docs). The app re-sends only within
+  23 h of the first send (1 h margin for clock drift); after that it doesn't POST and asks the user to
+  check their balance, because an expired key could create a second claim.
 
 ### Other assumptions
 - USD total = value of `available` only; `pending` and `claiming` are shown per asset but not in the total.
